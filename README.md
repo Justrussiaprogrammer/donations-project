@@ -9,10 +9,12 @@
 ### Запуск CPU
 
 ```bash
- ~/llama.cpp/build/bin/llama-server -hf Qwen/Qwen3-VL-8B-Instruct-GGUF:Q4_K_M -np 1 -t 6 --cache-ram 0 --host 127.0.0.1   --port 8081   -c 2048
+ ~/llama.cpp/build/bin/llama-server -hf Qwen/Qwen3-VL-8B-Instruct-GGUF:Q4_K_M \
+  -np 1 -t 6 --cache-ram 0 \
+  --host 127.0.0.1 --port 8081 -c 2048
 ```
 
-### Установка и запуск вулкана
+### Установка Vulkan
 
 ```bash
 sudo apt update
@@ -24,11 +26,15 @@ cmake -B build-vulkan -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build-vulkan -j$(nproc)
 ```
 
+### Запуск Vulkan
+
 ```bash
- ~/llama.cpp/build-vulkan/bin/llama-server -hf Qwen/Qwen3-VL-8B-Instruct-GGUF:Q4_K_M -np 1 -t 6 --cache-ram 0 --host 127.0.0.1   --port 8081   -c 2048
+ ~/llama.cpp/build-vulkan/bin/llama-server -hf Qwen/Qwen3-VL-8B-Instruct-GGUF:Q4_K_M \
+  -np 1 -t 6 --cache-ram 0 \
+  --host 127.0.0.1 --port 8081 -c 2048
 ```
 
-### Установка и запуск sycl
+### Установка sycl
 
 Установка компилятора Intel DPC++/C++:
 
@@ -88,10 +94,14 @@ cmake -B build-sycl \
 cmake --build build-sycl -j$(nproc)
 ```
 
+### Запуск Sycl
+
 ```bash
 source /opt/intel/oneapi/setvars.sh
 
- ~/llama.cpp/build-sycl/bin/llama-server -hf Qwen/Qwen3-VL-8B-Instruct-GGUF:Q4_K_M -np 1 -t 6 --cache-ram 0 --image-min-tokens 1024 --host 127.0.0.1   --port 8081   -c 2048
+ ~/llama.cpp/build-sycl/bin/llama-server -hf Qwen/Qwen3-VL-8B-Instruct-GGUF:Q4_K_M \
+  -np 1 -t 6 --cache-ram 0 --image-min-tokens 1024 \
+  --host 127.0.0.1 --port 8081 -c 2048
 ```
 
 Для запуска с моделями с предустановленным размышлением, надо его отключать через добавление флага --reasoning off
@@ -103,5 +113,8 @@ source /opt/intel/oneapi/setvars.sh
 ```bash
 source donate_env/bin/activate
 
-python3 scripts/vlm_pipeline.py   --project-dir .   --model models/best.pt   --video video_tests/test_fragment.mp4   --device cpu   --frame-step 10   --conf 0.25   --img-size 640   --vlm-server-url http://127.0.0.1:8081/v1/chat/completions   --vlm-model Qwen3-VL   --overwrite
+python3 scripts/vlm_pipeline.py --model models/best.pt --video video_tests/test_fragment.mp4 \
+  --device cpu --frame-step 10 --conf 0.25 --img-size 640 \
+  --vlm-server-url http://127.0.0.1:8081/v1/chat/completions \
+  --vlm-model Qwen3-VL --overwrite
 ```
