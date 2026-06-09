@@ -519,7 +519,7 @@ def _process_event_vlm(
             shutil.copy2(str(best_det.annotated_frame_path), str(best_frame_path))
         if best_det.original_frame_path:
             shutil.copy2(str(best_det.original_frame_path), str(best_original_frame_path))
-        saved_crop_path = str(best_crop_path)
+        saved_crop_path = str(best_crop_path.name)
     else:
         saved_crop_path = ""
 
@@ -570,7 +570,7 @@ def _process_event_vlm(
         "model_error": model_error,
     }
     jsonl_row = {
-        "file_name": saved_crop_path.name,
+        "file_name": saved_crop_path,
         "parsed_ok": parsed_ok,
         "error": model_error,
         "donor": parsed.get("donor", ""),
@@ -964,7 +964,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     p.add_argument("--project-dir", default=".")
-    p.add_argument("--model", default="models/best_openvino_model.pt")
+    p.add_argument("--model", default="models/best.pt")
     p.add_argument("--video", default="video_tests/test.mp4")
     p.add_argument("--output-dir", default="vlm_runs")
     p.add_argument("--run-name", default="")
