@@ -35,10 +35,6 @@ import requests
 from ultralytics import YOLO
 
 import os
-
-# Использовать только при запуске YOLO в сборке openvino
-os.environ["OPENVINO_DEVICE"] = "GPU"
-
 import time
 
 
@@ -1012,6 +1008,10 @@ def main() -> None:
         raise ValueError("--vlm-max-tokens must be >= 1")
     if args.vlm_timeout <= 0:
         raise ValueError("--vlm-timeout must be >= 1")
+
+    # Костыль для запуска openvino через обертку YOLO
+    if "openvino" in args.model:
+        os.environ["OPENVINO_DEVICE"] = "GPU"
 
     run_pipeline(args)
 

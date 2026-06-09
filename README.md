@@ -4,24 +4,75 @@
 
 Для работы надо настроить сервер локальной нейросети-OCR и сохранить модель YOLO для этапа обнаружения. Сервер можно поднимать любой, в пример приведена связка модели YOLOn + llama.cpp c Qwen3-VL-8B
 
+## Настройка среды и запуск
+
+В случае если вы не используете openvino для пересборки модели, не используйте модель с openvino в названии
+
+### Windows 11
+
+Для создания среды выполнения в системе должен быть установлен Python3. Запустите терминал из папки проекта. Создайте среду выполнения:
+
+```bash
+python3 -m venv donate_env
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\donate_env\Scripts\activate
+pip install -U pip
+pip install ultralytics opencv-python numpy requests
+```
+
+Запуск поиска из папки проекта:
+
+```bash
+.\donate_env\bin\python.exe scripts/vlm_pipeline.py --video video_tests/test_fragment.mp4 --overwrite
+```
+
+### Ubuntu 24.04
+
+Запустите терминал из папки проекта. Создайте среду выполнения:
+
+```bash
+sudo apt update
+sudo apt install python3-venv python3-pip ffmpeg
+
+python3 -m venv donate_env
+source donate_env/bin/activate
+pip install -U pip
+pip install ultralytics opencv-python-headless numpy requests
+```
+
+Запуск поиска из папки проекта:
+
+```bash
+source donate_env/bin/activate
+python3 scripts/vlm_pipeline.py --video video_tests/test_fragment.mp4 --vlm-model Qwen3-VL --overwrite
+```
+
 ## Настройка llama.cpp
 
-## Команды для запуска LLM для OCR
+В самом простом случае можно установить подходящий вам релиз с гитхаба <https://github.com/ggml-org/llama.cpp/releases>
+В случае если вам нужны рекомендации по сборке, в частности на графические процессоры Intel, они приведены ниже
 
 Проверено для Ubuntu 24.04
+
+Скачайте llama.cpp:
+
+```bash
+git clone https://github.com/ggerganov/llama.cpp
+cd llama.cpp
+```
 
 ### CPU
 
 #### Настройка под CPU
 
 ```bash
-cd ~/llama.cpp
-
 cmake -B build-cpu -DGGML_NATIVE=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build-cpu -j$(nproc)
 ```
 
 #### Запуск на CPU
+
+Лучше поменять флаг количество потоков -t на свой
 
 ```bash
  ~/llama.cpp/build-cpu/bin/llama-server -hf Qwen/Qwen3-VL-8B-Instruct-GGUF:Q4_K_M \
@@ -44,6 +95,8 @@ cmake --build build-vulkan -j$(nproc)
 ```
 
 #### Запуск на Vulkan
+
+Лучше поменять флаг количество потоков -t на свой
 
 ```bash
  ~/llama.cpp/build-vulkan/bin/llama-server -hf Qwen/Qwen3-VL-8B-Instruct-GGUF:Q4_K_M \
@@ -114,6 +167,8 @@ cmake --build build-sycl -j$(nproc)
 ```
 
 #### Запуск на SYCL
+
+Лучше поменять флаг количество потоков -t на свой
 
 ```bash
 source /opt/intel/oneapi/setvars.sh
