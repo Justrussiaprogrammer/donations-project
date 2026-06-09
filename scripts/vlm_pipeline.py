@@ -35,6 +35,8 @@ import requests
 from ultralytics import YOLO
 
 import os
+
+# Использовать только при запуске YOLO в сборке openvino
 os.environ["OPENVINO_DEVICE"] = "GPU"
 
 import time
@@ -990,10 +992,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Run YOLO/event grouping only, no VLM calls")
     p.add_argument("--sequential", action="store_true",
                    help="Run YOLO fully, then VLM fully (no overlap). "
-                        "Gives clean per-stage timing for benchmarking.")
+                        "Gives clean per-stage timing for benchmarking")
     p.add_argument("--no-save-images", action="store_true",
                    help="Do not save any image files (crops, frames). "
-                        "Output is CSV/JSONL only.")
+                        "Output is CSV/JSONL only")
 
     return p
 

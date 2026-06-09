@@ -1,20 +1,37 @@
-# Описание проекта по сбору информации о донатах из стримов
+# Сбор информации о донатах из стримов
+
+Проект позволяет получать данные о донатах на стримах
+
+Для работы надо настроить сервер локальной нейросети-OCR и сохранить модель YOLO для этапа обнаружения. Сервер можно поднимать любой, в пример приведена связка модели YOLOn + llama.cpp c Qwen3-VL-8B
 
 ## Настройка llama.cpp
 
-## Команды для запуска qwen3-VL-8b
+## Команды для запуска LLM для OCR
 
 Проверено для Ubuntu 24.04
 
-### Запуск CPU
+### CPU
+
+#### Настройка под CPU
 
 ```bash
- ~/llama.cpp/build/bin/llama-server -hf Qwen/Qwen3-VL-8B-Instruct-GGUF:Q4_K_M \
+cd ~/llama.cpp
+
+cmake -B build-cpu -DGGML_NATIVE=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build-cpu -j$(nproc)
+```
+
+#### Запуск на CPU
+
+```bash
+ ~/llama.cpp/build-cpu/bin/llama-server -hf Qwen/Qwen3-VL-8B-Instruct-GGUF:Q4_K_M \
   -np 1 -t 6 --cache-ram 0 \
   --host 127.0.0.1 --port 8081 -c 2048
 ```
 
-### Установка Vulkan
+### Vulkan
+
+#### Настройка под Vulkan
 
 ```bash
 sudo apt update
@@ -26,7 +43,7 @@ cmake -B build-vulkan -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build-vulkan -j$(nproc)
 ```
 
-### Запуск Vulkan
+#### Запуск на Vulkan
 
 ```bash
  ~/llama.cpp/build-vulkan/bin/llama-server -hf Qwen/Qwen3-VL-8B-Instruct-GGUF:Q4_K_M \
@@ -34,7 +51,9 @@ cmake --build build-vulkan -j$(nproc)
   --host 127.0.0.1 --port 8081 -c 2048
 ```
 
-### Установка sycl
+### SYCL
+
+#### Настройка под SYCl
 
 Установка компилятора Intel DPC++/C++:
 
@@ -78,7 +97,7 @@ sudo apt --fix-broken install -y
 sudo reboot
 ```
 
-Сборка sycl:
+Сборка SYCL:
 
 ```bash
 cd ~/llama.cpp
@@ -94,7 +113,7 @@ cmake -B build-sycl \
 cmake --build build-sycl -j$(nproc)
 ```
 
-### Запуск Sycl
+#### Запуск на SYCL
 
 ```bash
 source /opt/intel/oneapi/setvars.sh
@@ -104,9 +123,7 @@ source /opt/intel/oneapi/setvars.sh
   --host 127.0.0.1 --port 8081 -c 2048
 ```
 
-Для запуска с моделями с предустановленным размышлением, надо его отключать через добавление флага --reasoning off
-
-## Команда для обработки видео
+## Команда для сбора данных со стрима
 
 Запускается из корня проекта
 
