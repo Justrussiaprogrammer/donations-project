@@ -13,38 +13,44 @@
 Для создания среды выполнения в системе должен быть установлен Python3. Запустите терминал из папки проекта. Создайте среду выполнения:
 
 ```bash
-python3 -m venv donate_env
+python -m venv donate_env
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\donate_env\Scripts\activate
-pip install -U pip
-pip install ultralytics opencv-python numpy requests
+python -m pip install -U pip
+python -m pip install ultralytics requests
 ```
 
 Запуск поиска из папки проекта:
 
 ```bash
-.\donate_env\bin\python.exe scripts/vlm_pipeline.py --video video_tests/test_fragment.mp4 --overwrite
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\donate_env\Scripts\activate
+python scripts/vlm_pipeline.py --video stream.mp4
 ```
 
 ### Ubuntu 24.04
 
-Запустите терминал из папки проекта. Создайте среду выполнения:
+Возможно вам нужно подтянуть нужные библиотеки:
 
 ```bash
 sudo apt update
-sudo apt install python3-venv python3-pip ffmpeg
+sudo apt install python3-venv python3-pip ffmpeg libgl1 -y
+```
 
+Запустите терминал из папки проекта. Создайте среду выполнения:
+
+```bash
 python3 -m venv donate_env
 source donate_env/bin/activate
 pip install -U pip
-pip install ultralytics opencv-python-headless numpy requests
+pip install ultralytics requests
 ```
 
 Запуск поиска из папки проекта:
 
 ```bash
 source donate_env/bin/activate
-python3 scripts/vlm_pipeline.py --video video_tests/test_fragment.mp4 --vlm-model Qwen3-VL --overwrite
+python3 scripts/vlm_pipeline.py --video stream.mp4
 ```
 
 ## Настройка llama.cpp
