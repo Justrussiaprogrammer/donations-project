@@ -1,0 +1,7 @@
+# Зависимости для обоих движков (py и cpp).
+# cv2/numpy подтягиваются транзитивно через ultralytics.
+# Для cpp-движка дополнительно нужны системные g++ и ffmpeg,
+# затем сборка ./cpp/build.sh — openvino ниже даёт и C++ заголовки, и экспорт модели.
+ultralytics
+requests
+openvino

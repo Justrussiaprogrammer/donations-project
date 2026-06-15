@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
-Donation extraction pipeline v5 - memory-optimised fork (vlm_pipeline_old).
+Donation extraction pipeline v5 (memory-optimised). Main entry point.
 
-Changes vs vlm_pipeline.py:
+video -> YOLO donation detector -> event grouping -> best crop ->
+local Qwen3-VL via llama.cpp server -> JSON -> CSV/JSONL.
+
+Memory model:
   1. CandidateCrop stores file paths instead of numpy arrays.
      Images are written to a tmp dir immediately during YOLO stage,
      evicted candidates' files are deleted right away.
@@ -12,7 +15,7 @@ Changes vs vlm_pipeline.py:
      Old events are moved to a closed list once per frame, keeping the
      search O(active) instead of O(all).
 
-Everything else is identical to the original.
+The previous in-RAM version (v4) lives in archive/vlm_pipeline_old.py.
 """
 
 from __future__ import annotations
@@ -183,6 +186,8 @@ def json_dumps_compact(value: Any) -> str:
 # VLM prompt and call
 # -----------------------------
 
+VLM_PROMPT_VERSION = "v5.1"
+
 VLM_PROMPT = """
 Ты извлекаешь донат из ОДНОГО crop изображения стрима.
 
@@ -251,11 +256,14 @@ def call_vlm_for_image(
     timeout_sec: int = 300,
     max_tokens: int = 1024,
     temperature: float = 0.0,
-    prompt: str = VLM_PROMPT
+    prompt: str = VLM_PROMPT,
+    retries: int = 2,
 ) -> tuple[str, Optional[dict[str, Any]], str]:
     """
     Returns: raw_text, parsed_json_or_none, error_message.
     No semantic repair is performed here.
+    Network/server failures are retried up to `retries` times with backoff;
+    JSON parse failures are not retried (the model answer is deterministic at temp 0).
     """
 
     donation_schema = {
@@ -312,13 +320,21 @@ def call_vlm_for_image(
         }
     }
 
-    try:
-        response = requests.post(server_url, json=payload, timeout=timeout_sec)
-        response.raise_for_status()
-        data = response.json()
-        raw_text = data["choices"][0]["message"]["content"]
-    except Exception as exc:
-        return "", None, f"request_failed: {type(exc).__name__}: {exc}"
+    last_error = ""
+    raw_text = ""
+    for attempt in range(retries + 1):
+        try:
+            response = requests.post(server_url, json=payload, timeout=timeout_sec)
+            response.raise_for_status()
+            data = response.json()
+            raw_text = data["choices"][0]["message"]["content"]
+            break
+        except Exception as exc:
+            last_error = f"request_failed: {type(exc).__name__}: {exc}"
+            if attempt < retries:
+                time.sleep(1.0)
+    else:
+        return "", None, last_error
 
     try:
         parsed = extract_json_from_text(raw_text)
@@ -410,22 +426,32 @@ def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def build_totals_rows(event_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def build_totals_rows(event_rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    """Returns (per-currency totals, count of events excluded from totals).
+
+    Excluded: parse failures, needs_review, low detection confidence, missing amount.
+    The count is reported so the totals are not silently undercounted.
+    """
     totals: dict[str, dict[str, Any]] = {}
+    skipped = 0
 
     for row in event_rows:
         if not row.get("parsed_ok"):
+            skipped += 1
             continue
         if row.get("needs_review") is True or row.get("best_detection_confidence") < 0.5:
+            skipped += 1
             continue
 
         amount = row.get("amount")
         if amount in (None, ""):
+            skipped += 1
             continue
 
         try:
             amount_float = float(amount)
         except Exception:
+            skipped += 1
             continue
 
         currency = row.get("currency") or "NO_CURRENCY"
@@ -448,12 +474,52 @@ def build_totals_rows(event_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         amount_sum = data["amount_sum"]
         data["amount_sum"] = int(amount_sum) if amount_sum.is_integer() else round(amount_sum, 2)
         out.append(data)
-    return out
+    return out, skipped
 
 
 # -----------------------------
 # Per-event VLM processing (runs in worker thread)
 # -----------------------------
+
+def _make_error_rows(ev: DonationEvent, error: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Rows for an event that produced no VLM result, so it still appears in CSV/JSONL."""
+    event_row: dict[str, Any] = {
+        "event_id": ev.event_id,
+        "video_name": ev.video_name,
+        "start_time": seconds_to_timestamp(ev.start_sec),
+        "end_time": seconds_to_timestamp(ev.end_sec),
+        "duration": seconds_to_timestamp(ev.end_sec - ev.start_sec),
+        "first_frame": ev.first_frame,
+        "last_frame": ev.last_frame,
+        "detections_count": ev.detections_count,
+        "best_detection_confidence": round(ev.best_confidence, 4),
+        "best_detection_time": "",
+        "best_detection_frame": "",
+        "best_detection_score": "",
+        "base_box_json": "",
+        "padded_box_json": "",
+        "crop_path": "",
+        "parsed_ok": False,
+        "donor": "",
+        "amount": "",
+        "currency": "",
+        "message": "",
+        "needs_review": True,
+        "raw_model_response": "",
+        "model_error": error,
+    }
+    jsonl_row: dict[str, Any] = {
+        "file_name": "",
+        "parsed_ok": False,
+        "error": error,
+        "donor": "",
+        "amount": "",
+        "currency": "",
+        "message": "",
+        "needs_review": True,
+    }
+    return event_row, jsonl_row
+
 
 def _process_event_vlm(
     ev: DonationEvent,
@@ -466,42 +532,7 @@ def _process_event_vlm(
     best_det = max(ev.candidates, key=lambda c: c.score, default=None)
 
     if best_det is None:
-        event_row: dict[str, Any] = {
-            "event_id": ev.event_id,
-            "video_name": ev.video_name,
-            "start_time": seconds_to_timestamp(ev.start_sec),
-            "end_time": seconds_to_timestamp(ev.end_sec),
-            "duration_sec": round(ev.end_sec - ev.start_sec, 3),
-            "first_frame": ev.first_frame,
-            "last_frame": ev.last_frame,
-            "detections_count": ev.detections_count,
-            "best_detection_confidence": round(ev.best_confidence, 4),
-            "best_detection_time": "",
-            "best_detection_frame": "",
-            "best_detection_score": "",
-            "base_box_json": "",
-            "padded_box_json": "",
-            "crop_path": "",
-            "parsed_ok": False,
-            "donor": "",
-            "amount": "",
-            "currency": "",
-            "message": "",
-            "needs_review": True,
-            "raw_model_response": "",
-            "model_error": "no_candidate_crop",
-        }
-        jsonl_row: dict[str, Any] = {
-            "file_name": "",
-            "parsed_ok": False,
-            "error": "no_candidate_crop",
-            "donor": "",
-            "amount": "",
-            "currency": "",
-            "message": "",
-            "needs_review": True,
-        }
-        return event_row, jsonl_row
+        return _make_error_rows(ev, "no_candidate_crop")
 
     detection_time = seconds_to_timestamp(best_det.timestamp_sec)
     detection_time_safe = detection_time.replace(":", "-")
@@ -535,6 +566,7 @@ def _process_event_vlm(
             timeout_sec=args.vlm_timeout,
             max_tokens=args.vlm_max_tokens,
             temperature=args.vlm_temperature,
+            retries=args.vlm_retries,
         )
 
     parsed_ok = parsed is not None
@@ -545,7 +577,7 @@ def _process_event_vlm(
         "video_name": ev.video_name,
         "start_time": seconds_to_timestamp(ev.start_sec),
         "end_time": seconds_to_timestamp(ev.end_sec),
-        "duration_sec": round(ev.end_sec - ev.start_sec, 3),
+        "duration": seconds_to_timestamp(ev.end_sec - ev.start_sec),
         "first_frame": ev.first_frame,
         "last_frame": ev.last_frame,
         "detections_count": ev.detections_count,
@@ -603,6 +635,8 @@ def _vlm_worker(
                   f"donor={event_row.get('donor') or '?'} amount={event_row.get('amount') or '?'}")
         except Exception as exc:
             print(f"[VLM] event {ev.event_id} failed: {exc}")
+            with results_lock:
+                results.append(_make_error_rows(ev, f"worker_exception: {type(exc).__name__}: {exc}"))
         finally:
             vlm_queue.task_done()
 
@@ -635,8 +669,14 @@ def run_pipeline(args: argparse.Namespace) -> None:
     original_frames_dir = events_dir / "original_frames"
     tmp_dir = output_dir / "_tmp_candidates"
 
-    if output_dir.exists() and args.overwrite:
-        shutil.rmtree(output_dir)
+    if output_dir.exists():
+        if args.overwrite:
+            shutil.rmtree(output_dir)
+        elif any(output_dir.iterdir()):
+            raise FileExistsError(
+                f"Output dir already exists and is not empty: {output_dir}\n"
+                f"Use --overwrite to replace it or --run-name to pick another name."
+            )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -674,7 +714,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    print(f"FPS: {fps:.3f}, frames: {total_frames}, frame_step: {args.frame_step}]\n")
+    print(f"FPS: {fps:.3f}, frames: {total_frames}, frame_step: {args.frame_step}\n")
 
     all_events: list[DonationEvent] = []
     active_events: list[DonationEvent] = []
@@ -723,7 +763,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
 
         boxes = result.boxes
         if boxes is not None and len(boxes) > 0:
-            annotated = result.plot()
+            annotated = None if args.no_save_images else result.plot()
 
             for box in boxes:
                 cls_id = int(box.cls[0].cpu().item())
@@ -842,7 +882,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
 
     cap.release()
     yolo_elapsed = round(time.time() - stage_start_time, 2)
-    print(f"\nYOLO stage done in {yolo_elapsed}s.")
+    print(f"\nYOLO stage done in {seconds_to_timestamp(yolo_elapsed)}.")
     print(f"Sampled frames: {processed_frames}, detections: {raw_detections_count}, events: {len(all_events)}")
 
     # Clean up non-best candidates for events still active at end of video.
@@ -866,8 +906,9 @@ def run_pipeline(args: argparse.Namespace) -> None:
                       f"donor={event_row.get('donor') or '?'} amount={event_row.get('amount') or '?'}")
             except Exception as exc:
                 print(f"[VLM] event {ev.event_id} failed: {exc}")
+                vlm_results.append(_make_error_rows(ev, f"worker_exception: {type(exc).__name__}: {exc}"))
         vlm_elapsed = round(time.time() - vlm_start, 2)
-        print(f"VLM stage done in {vlm_elapsed}s.")
+        print(f"VLM stage done in {seconds_to_timestamp(vlm_elapsed)}.")
     else:
         # Flush remaining active events to worker thread, then wait for it to finish.
         for ev in active_events:
@@ -876,6 +917,9 @@ def run_pipeline(args: argparse.Namespace) -> None:
         print("Waiting for VLM worker to finish...")
         vlm_thread.join()
         vlm_results.sort(key=lambda r: r[0]["event_id"])
+
+    mode = "sequential" if args.sequential else "parallel"
+    wall_elapsed = round(time.time() - stage_start_time, 2)
 
     event_rows = [r[0] for r in vlm_results]
     jsonl_rows = [r[1] for r in vlm_results]
@@ -887,7 +931,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
     jsonl_path = output_dir / "donations.jsonl"
     metadata_json = output_dir / "run_metadata.json"
 
-    totals_rows = build_totals_rows(event_rows)
+    totals_rows, totals_skipped_events = build_totals_rows(event_rows)
 
     write_csv(events_csv, event_rows)
     write_csv(totals_csv, totals_rows)
@@ -897,6 +941,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
         json.dump(
             {
                 "project_dir": str(project_dir),
+                "run_name": run_name,
                 "yolo_model": str(model_path),
                 "video": str(video_path),
                 "fps": fps,
@@ -914,14 +959,20 @@ def run_pipeline(args: argparse.Namespace) -> None:
                 "event_center_thr": args.event_center_thr,
                 "vlm_server_url": args.vlm_server_url,
                 "vlm_model": args.vlm_model,
+                "vlm_prompt_version": VLM_PROMPT_VERSION,
+                "vlm_prompt": VLM_PROMPT,
+                "vlm_retries": args.vlm_retries,
                 "vlm_timeout": args.vlm_timeout,
                 "vlm_max_tokens": args.vlm_max_tokens,
                 "vlm_temperature": args.vlm_temperature,
                 "skip_vlm": args.skip_vlm,
                 "sequential": args.sequential,
                 "no_save_images": args.no_save_images,
+                "vlm_mode": mode,
                 "yolo_elapsed_sec": yolo_elapsed,
                 "vlm_elapsed_sec": vlm_elapsed,
+                "wall_elapsed_sec": wall_elapsed,
+                "totals_skipped_events": totals_skipped_events,
                 "outputs": {
                     "events_summary_csv": str(events_csv),
                     "totals_by_currency_csv": str(totals_csv),
@@ -935,14 +986,18 @@ def run_pipeline(args: argparse.Namespace) -> None:
         )
 
     print("\nDone.")
-    print(f"  YOLO stage:        {yolo_elapsed}s")
+    print(f"  Mode:              {mode}")
+    print(f"  YOLO detection:    {seconds_to_timestamp(yolo_elapsed)} (compute)")
     if vlm_elapsed is not None:
-        print(f"  VLM stage:         {vlm_elapsed}s")
+        print(f"  VLM stage:         {seconds_to_timestamp(vlm_elapsed)}")
     else:
-        print(f"  VLM stage:         ran in parallel with YOLO (no isolated time)")
+        print(f"  VLM stage:         перекрыт детекцией (отдельного времени нет)")
+    print(f"  Total wall clock:  {seconds_to_timestamp(wall_elapsed)}")
     print(f"  Sampled frames:    {processed_frames}")
     print(f"  Raw detections:    {raw_detections_count}")
     print(f"  Donation events:   {len(all_events)}")
+    if totals_skipped_events:
+        print(f"  Excluded from totals: {totals_skipped_events} event(s)")
     print(f"Events summary:      {events_csv}")
     print(f"Totals by currency:  {totals_csv}")
     print(f"Raw JSONL:           {jsonl_path}")
@@ -961,7 +1016,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--project-dir", default=".")
     p.add_argument("--model", default="models/best.pt")
-    p.add_argument("--video", default="video_tests/test.mp4")
+    p.add_argument("--video", default="test/video/test_fragment.mp4")
     p.add_argument("--output-dir", default="vlm_runs")
     p.add_argument("--run-name", default="")
     p.add_argument("--overwrite", action="store_true")
@@ -982,6 +1037,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--vlm-server-url", default="http://127.0.0.1:8081/v1/chat/completions")
     p.add_argument("--vlm-model", default="Qwen3-VL")
     p.add_argument("--vlm-timeout", type=int, default=300)
+    p.add_argument("--vlm-retries", type=int, default=2,
+                   help="Retries for failed VLM requests (network/server errors only)")
     p.add_argument("--vlm-max-tokens", type=int, default=1024)
     p.add_argument("--vlm-temperature", type=float, default=0.0)
     p.add_argument("--skip-vlm", action="store_true",
@@ -1008,10 +1065,6 @@ def main() -> None:
         raise ValueError("--vlm-max-tokens must be >= 1")
     if args.vlm_timeout <= 0:
         raise ValueError("--vlm-timeout must be >= 1")
-
-    # Костыль для запуска openvino через обертку YOLO
-    if "openvino" in args.model:
-        os.environ["OPENVINO_DEVICE"] = "GPU"
 
     run_pipeline(args)
 

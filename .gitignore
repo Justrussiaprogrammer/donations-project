@@ -1,5 +1,8 @@
 models
-video_files
+test
 donate_env
 vlm_runs
 ocr_runs
+__pycache__
+cpp/fast_detector
+benchmarks

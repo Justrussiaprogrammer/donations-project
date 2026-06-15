@@ -31,19 +31,19 @@ def save_jsons_from_model(folder, out_folder, server_url=SERVER_URL, model_name=
 
         if error:
             print(f"  ❌ Ошибка вызова: {error}")
-            parsed = None
+            parsed = {}
         elif parsed is None:
             print(f"  ❌ Не удалось извлечь JSON из ответа:\n{raw_text[:200]}")
-        else:
-            parsed = {"file_name": img_path.name, **parsed}
-        
+            parsed = {}
+
         summary_data.append({
-            "file_name": parsed.get("file_name", ""),
+            "file_name": img_path.name,
             "donor": parsed.get("donor", ""),
             "amount": parsed.get("amount", ""),
             "currency": parsed.get("currency", ""),
             "message": parsed.get("message", ""),
             "needs_review": parsed.get("needs_review", True),
+            "error": error,
         })
     
     print("Модель проанализировала все изображения")
@@ -66,30 +66,26 @@ def compare_fields(pred, gt):
         pred_val = pred.get(f)
         gt_val = gt.get(f)
 
-        if f == 'amount_number':
-            if pred_val == gt_val:
-                similarity = 1.0
-            else:
+        if pred_val is None and gt_val is None:
+            similarity = 1.0
+        elif pred_val is None or gt_val is None:
+            similarity = 0.0
+        elif f == 'amount':
+            # Числовое сравнение: 1500 == 1500.0 == "1500"
+            try:
+                similarity = 1.0 if float(pred_val) == float(gt_val) else 0.0
+            except (TypeError, ValueError):
                 similarity = 0.0
-            comp[f] = {
-                "predicted": pred_val,
-                "ground_truth": gt_val,
-                "similarity": similarity
-            }
         else:
-            if pred_val is None and gt_val is None:
-                similarity = 1.0
-            elif pred_val is None or gt_val is None:
-                similarity = 0.0
-            else:
-                p_str = str(pred_val).strip()
-                g_str = str(gt_val).strip()
-                similarity = SequenceMatcher(None, p_str, g_str).ratio()
-            comp[f] = {
-                "predicted": pred_val,
-                "ground_truth": gt_val,
-                "similarity": similarity
-            }
+            p_str = str(pred_val).strip()
+            g_str = str(gt_val).strip()
+            similarity = SequenceMatcher(None, p_str, g_str).ratio()
+
+        comp[f] = {
+            "predicted": pred_val,
+            "ground_truth": gt_val,
+            "similarity": similarity
+        }
 
         if similarity != 1.0:
             all_match = False
@@ -111,8 +107,17 @@ def main():
         if gt is None:
             print("  ⚠ Нет эталона, пропускаю.")
             return
-    
-    for img_path, true_json in zip(image_files, gt.get("examples")):
+
+    # Сопоставление эталона по file_name, а не по порядку файлов:
+    # пропуск/добавление одного кропа не сдвигает всю разметку.
+    gt_examples = gt.get("donations") or gt.get("examples") or []
+    gt_by_name = {ex.get("file_name"): ex for ex in gt_examples}
+
+    for img_path in image_files:
+        true_json = gt_by_name.get(img_path.name)
+        if true_json is None:
+            print(f"⚠ Нет эталона для {img_path.name}, пропускаю.")
+            continue
         print(f"Обрабатываю: {img_path.name}")
 
         raw_text, parsed, error = vlm_pipeline.call_vlm_for_image(
@@ -132,7 +137,7 @@ def main():
             result = {
                 "image": img_path.name,
                 "all_fields_correct": False,
-                "fields": {f: {"predicted": None, "ground_truth": gt.get(f), "similarity": 0.0} for f in ['donor','amount','currency','message']},
+                "fields": {f: {"predicted": None, "ground_truth": true_json.get(f), "similarity": 0.0} for f in ['donor','amount','currency','message']},
                 "error": error or "json_parse_failed"
             }
         else:
@@ -151,7 +156,7 @@ def main():
 
         row = {"image": img_path.name}
         for f in ['donor','amount','currency','message']:
-            row[f"{f}_similarity"] = result["fields"][f]["similarity"] if not error else False
+            row[f"{f}_similarity"] = result["fields"][f]["similarity"]
         row["all_correct"] = result["all_fields_correct"]
         summary_data.append(row)
 
