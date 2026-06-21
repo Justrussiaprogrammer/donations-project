@@ -32,7 +32,7 @@ cmake --build build-cpu -j$(nproc)
 ```bash
  ~/llama.cpp/build-cpu/bin/llama-server -hf Qwen/Qwen3-VL-8B-Instruct-GGUF:Q4_K_M \
   -np 1 -t 6 --cache-ram 0 \
-  --host 127.0.0.1 --port 8081 -c 2048
+  --host 127.0.0.1 --port 8081 -c 3072
 ```
 
 ## Vulkan
@@ -56,7 +56,7 @@ cmake --build build-vulkan -j$(nproc)
 ```bash
  ~/llama.cpp/build-vulkan/bin/llama-server -hf Qwen/Qwen3-VL-8B-Instruct-GGUF:Q4_K_M \
   -np 1 -t 6 --cache-ram 0 \
-  --host 127.0.0.1 --port 8081 -c 2048
+  --host 127.0.0.1 --port 8081 -c 3072
 ```
 
 ## SYCL
@@ -128,5 +128,5 @@ source /opt/intel/oneapi/setvars.sh
 
  ~/llama.cpp/build-sycl/bin/llama-server -hf Qwen/Qwen3-VL-8B-Instruct-GGUF:Q4_K_M \
   -np 1 -t 6 --cache-ram 0 --image-min-tokens 1024 \
-  --host 127.0.0.1 --port 8081 -c 2048
+  --host 127.0.0.1 --port 8081 -c 3072
 ```

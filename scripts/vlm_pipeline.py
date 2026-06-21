@@ -25,6 +25,7 @@ import base64
 import csv
 import json
 import queue
+import random
 import re
 import shutil
 import threading
@@ -186,7 +187,7 @@ def json_dumps_compact(value: Any) -> str:
 # VLM prompt and call
 # -----------------------------
 
-VLM_PROMPT_VERSION = "v5.1"
+VLM_PROMPT_VERSION = "v7"
 
 VLM_PROMPT = """
 Ты извлекаешь донат из ОДНОГО crop изображения стрима.
@@ -200,6 +201,7 @@ VLM_PROMPT = """
 1. ВЕРХНИЙ крупный заголовок доната.
 2. Иногда заголовок визуально разбит на две строки.
 3. НИЖНИЙ текст сообщения, обычно меньшим шрифтом.
+4. Иногда СЛЕВА от имени донатера маленькое СЕРДЦЕ (♥/❤) — пометка, что донатер покрыл комиссию перевода.
 
 ## ОЧЕНЬ ВАЖНЫЕ ПРАВИЛА LAYOUT:
 - donor находится в ВЕРХНЕМ заголовке доната, до тире/дефиса перед суммой.
@@ -207,6 +209,19 @@ VLM_PROMPT = """
 - message находится НИЖЕ заголовка и суммы, обычно меньшим шрифтом.
 - Никогда не используй нижнее сообщение как donor, если сверху есть заголовок вида "donor - amount".
 - Не включай donor и amount в message.
+
+## ГРАНИЦА ДОНАТА — что переписывать, а что НЕТ:
+- Плашка доната — это отдельная панель (подложка/рамка) поверх видео. Извлекай текст ТОЛЬКО с этой панели: заголовок донатера и его сообщение.
+- Crop часто захватывает кусок самого видео/стрима ПОД и ВОКРУГ плашки. Текст, который принадлежит фоновому видео, — НЕ часть доната. Полностью игнорируй его, не переписывай ни в одно поле.
+- НЕ включай в message текст фона, например: субтитры и реплики из видео, название ролика, имя канала, элементы плеера (таймкоды вида "9:06 / 12:50", "HD", "FULL HD", стрелки ▶), водяные знаки, любой интерфейс.
+- Признаки фона: текст лежит за краем панели доната, перекрывается ею, набран другим шрифтом/стилем, обрывается на полуслове у края crop, не связан по смыслу с сообщением доната.
+- Бери ровно тот текст, что находится ВНУТРИ панели доната. Если строка за её пределами — не трогай.
+- Если не уверен, относится строка к донату или к фону — НЕ включай её и поставь needs_review = true.
+
+## ПРАВИЛО СЕРДЦА (покрытие комиссии):
+- Если СЛЕВА от имени донатера есть символ сердца (♥, ❤ и похожие) — поставь fee_covered = true.
+- Если сердца нет — fee_covered = false.
+- Сердце НЕ часть имени: никогда не добавляй символ сердца в donor, верни только чистое имя.
 
 ## ПРАВИЛА СУММЫ:
 - Если написано "200!", amount = 200, currency = null.
@@ -223,6 +238,11 @@ VLM_PROMPT = """
 - Не теряй старший разряд суммы.
 
 ## ПРАВИЛА ЧТЕНИЯ ТЕКСТА:
+- message — это ВЕСЬ текст сообщения доната под заголовком, переписанный дословно (но только текст самой плашки, см. «ГРАНИЦА ДОНАТА»).
+- Если под заголовком есть любой текст, ссылка (http, https, t.me, youtu.be и т.п.) или их сочетание — обязательно перепиши его ПОЛНОСТЬЮ в message.
+- Ссылка — это тоже сообщение. Никогда не выбрасывай message и не ставь null только потому, что это ссылка или «не похоже на сообщение».
+- message = null ТОЛЬКО если под заголовком реально нет никакого текста доната.
+- Если сообщение доната занимает несколько строк, СКЛЕЙ их в одну сплошную строку через пробел. НИКОГДА не вставляй символ переноса "\\n" и переводы строк — message всегда одна строка без переносов.
 - Извлекай только то, что реально видно.
 - Не выдумывай продолжение.
 - Не повторяй фразы несколько раз.
@@ -237,6 +257,7 @@ VLM_PROMPT = """
 - Неясно, где заканчивается имя и начинается сумма.
 - Есть несколько интерпретаций layout.
 - Сумма содержит нестандартные символы.
+- Непонятно, относится ли часть текста к донату или к фоновому видео.
 
 Верни JSON строго по этой схеме:
 {
@@ -244,6 +265,7 @@ VLM_PROMPT = """
   "amount": number или null,
   "currency": string или null,
   "message": string или null,
+  "fee_covered": boolean,
   "needs_review": boolean
 }
 """
@@ -283,14 +305,18 @@ def call_vlm_for_image(
             },
             "message": {
                 "type": ["string", "null"],
-                "description": "Текст сообщения ниже заголовка"
+                "description": "Текст сообщения ниже заголовка (включая ссылки)"
+            },
+            "fee_covered": {
+                "type": "boolean",
+                "description": "true, если слева от имени есть сердце (донатер покрыл комиссию)"
             },
             "needs_review": {
                 "type": "boolean",
                 "description": "true, если что-то нечитаемо или неоднозначно"
             }
         },
-        "required": ["donor", "amount", "currency", "message", "needs_review"],
+        "required": ["donor", "amount", "currency", "message", "fee_covered", "needs_review"],
         "additionalProperties": False
     }
 
@@ -407,6 +433,180 @@ def add_candidate(event: DonationEvent, candidate: CandidateCrop, max_candidates
 
 
 # -----------------------------
+# Training-data collection (optional): harvest frames to improve the YOLO detector
+# -----------------------------
+
+TRAIN_STRATEGIES = ("uncertain", "worst", "negatives", "random")
+
+
+def yolo_label_lines(
+    boxes: list[tuple[tuple[int, int, int, int], float, int]],
+    frame_w: int,
+    frame_h: int,
+) -> list[str]:
+    """YOLO-format label lines (`class cx cy w h`, normalized) for every box in a frame.
+
+    A training label must list ALL objects in the image — a partially-labelled
+    frame would teach the detector that a real plaque is background.
+    """
+    lines: list[str] = []
+    if frame_w <= 0 or frame_h <= 0:
+        return lines
+    for (x1, y1, x2, y2), _conf, cls_id in boxes:
+        bw, bh = x2 - x1, y2 - y1
+        if bw <= 0 or bh <= 0:
+            continue
+        cx = (x1 + x2) / 2.0 / frame_w
+        cy = (y1 + y2) / 2.0 / frame_h
+        lines.append(f"{int(cls_id)} {cx:.6f} {cy:.6f} {bw / frame_w:.6f} {bh / frame_h:.6f}")
+    return lines
+
+
+class TrainingCollector:
+    """Harvest full frames + YOLO labels + annotated previews for detector retraining.
+
+    Box classification (confident vs uncertain) is done by the caller; this class
+    just routes already-classified boxes. Strategies (any subset of TRAIN_STRATEGIES):
+      uncertain  — frames with a weak fire: a box in [uncertain_min, conf) (the caller
+                   runs detection at the lower floor). Decision-boundary cases.
+      worst      — the lowest-score confident detections within each event (weak hits).
+      negatives  — sampled frames with NO detections at all (cut false positives).
+      random     — random frames from events (frames with a confident detection).
+
+    uncertain/negatives/random each keep up to `budget` frames via reservoir
+    sampling; worst keeps `worst_per_event` per event. Files are written straight
+    into images/ + labels/ + previews/ and evicted samples are deleted, so the
+    output always holds exactly the survivors. Labels for `negatives` are an empty
+    .txt (explicit background); previews are written only when there are boxes.
+    """
+
+    def __init__(
+        self,
+        train_dir: Path,
+        strategies: set[str],
+        budget: int,
+        worst_per_event: int,
+        conf_thr: float,
+        uncertain_min: float,
+        image_ext: str = ".jpg",
+    ) -> None:
+        self.dir = train_dir
+        self.images_dir = train_dir / "images"
+        self.labels_dir = train_dir / "labels"
+        self.previews_dir = train_dir / "previews"
+        for d in (self.images_dir, self.labels_dir, self.previews_dir):
+            d.mkdir(parents=True, exist_ok=True)
+        self.strategies = set(strategies)
+        self.budget = max(1, budget)
+        self.worst_per_event = max(1, worst_per_event)
+        # info only — box classification (confident vs uncertain) happens in the loop
+        self.conf_thr = conf_thr
+        self.uncertain_min = uncertain_min
+        self.ext = image_ext
+        self._seq = 0
+        self._rng = random.Random(0)  # deterministic sampling across runs
+        self._res: dict[str, dict[str, Any]] = {
+            k: {"seen": 0, "items": []} for k in ("uncertain", "negatives", "random")
+        }
+        self._worst: dict[int, list[dict[str, Any]]] = {}  # event_id -> kept-lowest records
+        self.saved_counts: dict[str, int] = {k: 0 for k in TRAIN_STRATEGIES}
+
+    def _write(self, prefix, frame, label_lines, annotated, frame_idx) -> dict[str, Any]:
+        self._seq += 1
+        stem = f"{prefix}_{self._seq:06d}_f{frame_idx:07d}"
+        img_path = self.images_dir / f"{stem}{self.ext}"
+        lbl_path = self.labels_dir / f"{stem}.txt"
+        cv2.imwrite(str(img_path), frame)
+        lbl_path.write_text(
+            ("\n".join(label_lines) + "\n") if label_lines else "", encoding="utf-8"
+        )
+        prev_path = None
+        if annotated is not None and label_lines:
+            prev_path = self.previews_dir / f"{stem}{self.ext}"
+            cv2.imwrite(str(prev_path), annotated)
+        return {"img": img_path, "lbl": lbl_path, "prev": prev_path, "frame_idx": frame_idx}
+
+    @staticmethod
+    def _delete(record: dict[str, Any]) -> None:
+        for key in ("img", "lbl", "prev"):
+            p = record.get(key)
+            if p is not None:
+                try:
+                    p.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    def _reservoir_offer(self, name, frame, label_lines, annotated, frame_idx) -> None:
+        """Standard reservoir sampling: bounded disk, uniform over the stream."""
+        state = self._res[name]
+        state["seen"] += 1
+        items = state["items"]
+        if len(items) < self.budget:
+            items.append(self._write(name, frame, label_lines, annotated, frame_idx))
+        else:
+            j = self._rng.randint(0, state["seen"] - 1)
+            if j < self.budget:
+                self._delete(items[j])
+                items[j] = self._write(name, frame, label_lines, annotated, frame_idx)
+
+    def observe_frame(self, frame, confident_boxes, uncertain_boxes, frame_idx, frame_w, frame_h, annotated) -> None:
+        """Frame-level strategies, called once per sampled frame.
+
+        confident_boxes — детекции с conf >= conf_thr (настоящие донаты, позитивы);
+        uncertain_boxes — детекции с conf в [uncertain_min, conf_thr) (слабые срабатывания).
+        Разметка кадра — всегда только уверенные боксы; слабые видны на превью и
+        размечаются человеком.
+        """
+        conf_labels = yolo_label_lines(confident_boxes, frame_w, frame_h)
+        # random: случайные кадры ИЗ событий (кадры с уверенной детекцией), не лучшие/худшие
+        if "random" in self.strategies and confident_boxes:
+            self._reservoir_offer("random", frame, conf_labels, annotated, frame_idx)
+        # negatives: модель вообще не сработала (ни одного бокса даже на пороге floor)
+        if "negatives" in self.strategies and not confident_boxes and not uncertain_boxes:
+            self._reservoir_offer("negatives", frame, [], None, frame_idx)
+        # uncertain: модель сработала слабо (бокс в [uncertain_min, conf)) — информативные негативы/границы
+        if "uncertain" in self.strategies and uncertain_boxes:
+            self._reservoir_offer("uncertain", frame, conf_labels, annotated, frame_idx)
+
+    def observe_worst(self, event_id, score, frame, frame_boxes, frame_idx, frame_w, frame_h, annotated) -> None:
+        """Keep the lowest-score frame(s) per event (called once per event present in a frame)."""
+        if "worst" not in self.strategies:
+            return
+        records = self._worst.setdefault(event_id, [])
+        if any(r["frame_idx"] == frame_idx for r in records):
+            return  # this frame already captured for this event
+        label_lines = yolo_label_lines(frame_boxes, frame_w, frame_h)
+        if len(records) < self.worst_per_event:
+            rec = self._write("worst", frame, label_lines, annotated, frame_idx)
+            rec["score"] = score
+            records.append(rec)
+        else:
+            hi_idx = max(range(len(records)), key=lambda i: records[i]["score"])
+            if score < records[hi_idx]["score"]:
+                self._delete(records[hi_idx])
+                rec = self._write("worst", frame, label_lines, annotated, frame_idx)
+                rec["score"] = score
+                records[hi_idx] = rec
+
+    def finalize(self) -> dict[str, int]:
+        for name in ("uncertain", "negatives", "random"):
+            self.saved_counts[name] = len(self._res[name]["items"])
+        self.saved_counts["worst"] = sum(len(v) for v in self._worst.values())
+        info = {
+            "strategies": sorted(self.strategies),
+            "budget_per_strategy": self.budget,
+            "worst_per_event": self.worst_per_event,
+            "uncertain_conf_band": [self.uncertain_min, self.conf_thr],
+            "saved_counts": {k: self.saved_counts[k] for k in sorted(self.strategies)},
+            "layout": "images/ + labels/ (YOLO txt) + previews/",
+        }
+        (self.dir / "_training_info.json").write_text(
+            json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        return self.saved_counts
+
+
+# -----------------------------
 # CSV helpers
 # -----------------------------
 
@@ -504,6 +704,7 @@ def _make_error_rows(ev: DonationEvent, error: str) -> tuple[dict[str, Any], dic
         "amount": "",
         "currency": "",
         "message": "",
+        "fee_covered": False,
         "needs_review": True,
         "raw_model_response": "",
         "model_error": error,
@@ -516,6 +717,7 @@ def _make_error_rows(ev: DonationEvent, error: str) -> tuple[dict[str, Any], dic
         "amount": "",
         "currency": "",
         "message": "",
+        "fee_covered": False,
         "needs_review": True,
     }
     return event_row, jsonl_row
@@ -593,6 +795,7 @@ def _process_event_vlm(
         "amount": parsed.get("amount", ""),
         "currency": parsed.get("currency", ""),
         "message": parsed.get("message", ""),
+        "fee_covered": parsed.get("fee_covered", False),
         "needs_review": parsed.get("needs_review", True),
         "raw_model_response": raw_text,
         "model_error": model_error,
@@ -605,6 +808,7 @@ def _process_event_vlm(
         "amount": parsed.get("amount", ""),
         "currency": parsed.get("currency", ""),
         "message": parsed.get("message", ""),
+        "fee_covered": parsed.get("fee_covered", False),
         "needs_review": parsed.get("needs_review", True),
     }
     return event_row, jsonl_row
@@ -688,10 +892,42 @@ def run_pipeline(args: argparse.Namespace) -> None:
 
     print(f"Project:      {project_dir}")
     print(f"YOLO model:   {model_path}")
+    print(f"YOLO device:  {args.device}")
     print(f"Video:        {video_path}")
     print(f"Output:       {output_dir}")
     print(f"VLM server:   {args.vlm_server_url}")
     print(f"VLM model:    {args.vlm_model}")
+
+    # Optional training-data collection (improves the YOLO detector).
+    train_strategies = {s.strip() for s in args.train_select.split(",") if s.strip()}
+    train_dir: Optional[Path] = None
+    collector: Optional[TrainingCollector] = None
+    if train_strategies:
+        if not args.skip_vlm:
+            args.skip_vlm = True
+            print("Training-data collection is on -> VLM stage skipped (--skip-vlm forced).")
+        train_dir = Path(args.train_dir).expanduser() if args.train_dir else (output_dir / "training_data")
+        if not train_dir.is_absolute():
+            train_dir = project_dir / train_dir
+        collector = TrainingCollector(
+            train_dir=train_dir,
+            strategies=train_strategies,
+            budget=args.train_budget,
+            worst_per_event=args.train_worst_per_event,
+            conf_thr=args.conf,
+            uncertain_min=args.train_uncertain_min,
+        )
+        print(f"Training data: {sorted(train_strategies)} -> {train_dir}")
+    # 'uncertain' needs to see weak fires below --conf, so run detection at the lower
+    # floor; boxes >= --conf are still the only ones that feed events (so grouping is
+    # unchanged), boxes in [floor, --conf) are captured for training only.
+    uncertain_on = collector is not None and "uncertain" in train_strategies
+    detect_conf = args.train_uncertain_min if uncertain_on else args.conf
+    if uncertain_on:
+        print(f"Detection threshold lowered to {detect_conf} for 'uncertain' capture "
+              f"(donations still require conf >= {args.conf}).")
+    # Annotated previews need result.plot() even when --no-save-images is set.
+    need_annotated = (not args.no_save_images) or (collector is not None)
 
     vlm_queue: queue.Queue = queue.Queue()
     vlm_results: list[tuple[dict[str, Any], dict[str, Any]]] = []
@@ -729,13 +965,17 @@ def run_pipeline(args: argparse.Namespace) -> None:
     batch_start_time = stage_start_time
 
     while True:
+        # Skipped frames: only advance the decoder (grab), don't pay for the
+        # full decode-to-numpy (retrieve) of a frame we won't process.
+        if frame_idx % args.frame_step != 0:
+            if not cap.grab():
+                break
+            frame_idx += 1
+            continue
+
         ok, frame = cap.read()
         if not ok:
             break
-
-        if frame_idx % args.frame_step != 0:
-            frame_idx += 1
-            continue
 
         processed_frames += 1
         timestamp_sec = frame_idx / fps
@@ -755,15 +995,23 @@ def run_pipeline(args: argparse.Namespace) -> None:
 
         result = model.predict(
             source=frame,
-            conf=args.conf,
+            conf=detect_conf,
             imgsz=args.img_size,
             device=args.device,
             verbose=False,
         )[0]
 
         boxes = result.boxes
+        # Per-frame accumulators for training-data collection (see collector calls below).
+        # confident_boxes: conf >= args.conf (real donations -> events + labels).
+        # uncertain_boxes: conf in [detect_conf, args.conf) (weak fires, only when detection
+        # ran at the lower floor for the 'uncertain' strategy).
+        confident_boxes: list[tuple[tuple[int, int, int, int], float, int]] = []
+        uncertain_boxes: list[tuple[tuple[int, int, int, int], float, int]] = []
+        frame_dets: list[tuple[int, float]] = []  # (event_id, candidate_score) for 'worst'
+        annotated = None
         if boxes is not None and len(boxes) > 0:
-            annotated = None if args.no_save_images else result.plot()
+            annotated = result.plot() if need_annotated else None
 
             for box in boxes:
                 cls_id = int(box.cls[0].cpu().item())
@@ -776,6 +1024,12 @@ def run_pipeline(args: argparse.Namespace) -> None:
                     clamp(x2, 0, w - 1),
                     clamp(y2, 0, h - 1),
                 )
+                if conf < args.conf:
+                    # below the donation threshold -> uncertain (training capture only);
+                    # does NOT take part in event grouping/candidates.
+                    uncertain_boxes.append((base_box, conf, cls_id))
+                    continue
+                confident_boxes.append((base_box, conf, cls_id))
                 padded_box = expand_box(base_box, w, h, args.padding_x, args.padding_y)
                 px1, py1, px2, py2 = padded_box
                 crop = frame[py1:py2, px1:px2].copy()
@@ -864,7 +1118,19 @@ def run_pipeline(args: argparse.Namespace) -> None:
                     score=candidate_score,
                 )
                 add_candidate(matched, candidate, args.keep_top_candidates)
+                frame_dets.append((matched.event_id, candidate_score))
                 raw_detections_count += 1
+
+        if collector is not None:
+            # worst: one record per event present in this frame (its min detection score),
+            # deferred to here so the label captures ALL confident boxes in the frame.
+            if "worst" in train_strategies and frame_dets:
+                by_event: dict[int, float] = {}
+                for eid, sc in frame_dets:
+                    by_event[eid] = sc if eid not in by_event else min(by_event[eid], sc)
+                for eid, sc in by_event.items():
+                    collector.observe_worst(eid, sc, frame, confident_boxes, frame_idx, w, h, annotated)
+            collector.observe_frame(frame, confident_boxes, uncertain_boxes, frame_idx, w, h, annotated)
 
         if args.max_processed_frames and processed_frames >= args.max_processed_frames:
             break
@@ -890,6 +1156,12 @@ def run_pipeline(args: argparse.Namespace) -> None:
         for evicted in ev.candidates[1:]:
             _delete_candidate_files(evicted)
         ev.candidates = ev.candidates[:1]
+
+    training_summary: Optional[dict[str, int]] = None
+    if collector is not None:
+        training_summary = collector.finalize()
+        print("Training data saved to " + str(train_dir) + ": "
+              + ", ".join(f"{k}={training_summary[k]}" for k in sorted(train_strategies)))
 
     vlm_elapsed: Optional[float] = None
 
@@ -973,6 +1245,14 @@ def run_pipeline(args: argparse.Namespace) -> None:
                 "vlm_elapsed_sec": vlm_elapsed,
                 "wall_elapsed_sec": wall_elapsed,
                 "totals_skipped_events": totals_skipped_events,
+                "training_data": None if collector is None else {
+                    "dir": str(train_dir),
+                    "strategies": sorted(train_strategies),
+                    "budget_per_strategy": args.train_budget,
+                    "worst_per_event": args.train_worst_per_event,
+                    "uncertain_conf_band": [args.train_uncertain_min, args.conf],
+                    "saved_counts": training_summary,
+                },
                 "outputs": {
                     "events_summary_csv": str(events_csv),
                     "totals_by_currency_csv": str(totals_csv),
@@ -1021,7 +1301,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--run-name", default="")
     p.add_argument("--overwrite", action="store_true")
 
-    p.add_argument("--device", default="cpu", help="cpu or CUDA device index, e.g. 0")
+    p.add_argument("--device", default="cpu",
+                   help="Передаётся в ultralytics как есть. Для .pt: 'cpu' или CUDA-индекс "
+                        "('0', 'cuda:0'). Для OpenVINO-модели: 'intel:cpu' / 'intel:gpu' / "
+                        "'intel:npu'. Значение по умолчанию 'cpu'")
     p.add_argument("--img-size", type=int, default=640)
     p.add_argument("--conf", type=float, default=0.5)
     p.add_argument("--frame-step", type=int, default=10)
@@ -1050,6 +1333,23 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Do not save any image files (crops, frames). "
                         "Output is CSV/JSONL only")
 
+    # Training-data collection (for improving the YOLO detector). Independent of
+    # the event-crop saving above; pairs naturally with --skip-vlm.
+    p.add_argument("--train-select", default="",
+                   help="Сбор кадров для дообучения детектора: список через запятую из "
+                        f"{','.join(TRAIN_STRATEGIES)} (пусто = выкл). "
+                        "Пишет full-frame + YOLO-разметку + аннотированные превью")
+    p.add_argument("--train-dir", default="",
+                   help="Куда складывать обучающие кадры (по умолчанию <output_dir>/training_data)")
+    p.add_argument("--train-budget", type=int, default=200,
+                   help="Лимит кадров (reservoir) на стратегию uncertain/negatives/random")
+    p.add_argument("--train-worst-per-event", type=int, default=1,
+                   help="Сколько худших кадров сохранять на событие (стратегия worst)")
+    p.add_argument("--train-uncertain-min", type=float, default=0.25,
+                   help="Нижняя граница confidence для 'uncertain' (верхняя = --conf). "
+                        "При включённой 'uncertain' детекция запускается на этом пороге, "
+                        "чтобы увидеть слабые срабатывания в [min, conf)")
+
     return p
 
 
@@ -1065,6 +1365,21 @@ def main() -> None:
         raise ValueError("--vlm-max-tokens must be >= 1")
     if args.vlm_timeout <= 0:
         raise ValueError("--vlm-timeout must be >= 1")
+
+    if args.train_select.strip():
+        sel = {s.strip() for s in args.train_select.split(",") if s.strip()}
+        unknown = sel - set(TRAIN_STRATEGIES)
+        if unknown:
+            raise ValueError(
+                f"--train-select: неизвестные стратегии {sorted(unknown)}; "
+                f"доступны {list(TRAIN_STRATEGIES)}"
+            )
+        if args.train_budget <= 0:
+            raise ValueError("--train-budget must be >= 1")
+        if args.train_worst_per_event <= 0:
+            raise ValueError("--train-worst-per-event must be >= 1")
+        if "uncertain" in sel and not (0.0 < args.train_uncertain_min < args.conf):
+            raise ValueError("--train-uncertain-min должен быть в диапазоне (0, --conf)")
 
     run_pipeline(args)
 

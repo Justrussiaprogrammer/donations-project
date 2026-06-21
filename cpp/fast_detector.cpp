@@ -48,6 +48,21 @@
 #include <thread>
 #include <vector>
 
+// Cross-platform process pipe + null device. On Windows the rawvideo pipe must
+// be opened in binary mode ("rb") or CRLF translation corrupts the byte stream.
+#ifdef _WIN32
+#  include <io.h>
+#  define OV_POPEN  _popen
+#  define OV_PCLOSE _pclose
+#  define OV_DEVNULL "NUL"
+#  define OV_PIPE_READ "rb"  // binary: avoid CRLF translation of the rawvideo stream
+#else
+#  define OV_POPEN  popen
+#  define OV_PCLOSE pclose
+#  define OV_DEVNULL "/dev/null"
+#  define OV_PIPE_READ "r"   // POSIX pipes have no text/binary mode; glibc rejects "rb"
+#endif
+
 namespace {
 
 // -----------------------------
@@ -271,19 +286,30 @@ private:
 
 struct VideoInfo { int width = 0, height = 0; double fps = 30.0; long nb_frames = 0; };
 
+#ifdef _WIN32
+// cmd.exe quoting: wrap in double quotes and escape embedded double quotes.
+std::string shell_quote(const std::string& s) {
+    std::string out = "\"";
+    for (char c : s) out += (c == '"') ? std::string("\\\"") : std::string(1, c);
+    out += "\"";
+    return out;
+}
+#else
+// POSIX /bin/sh quoting: wrap in single quotes.
 std::string shell_quote(const std::string& s) {
     std::string out = "'";
     for (char c : s) out += (c == '\'') ? std::string("'\\''") : std::string(1, c);
     out += "'";
     return out;
 }
+#endif
 
 VideoInfo probe_video(const std::string& path) {
     std::string cmd =
         "ffprobe -v error -select_streams v:0 "
         "-show_entries stream=width,height,r_frame_rate,nb_frames "
-        "-of default=nw=1 " + shell_quote(path) + " 2>/dev/null";
-    FILE* p = popen(cmd.c_str(), "r");
+        "-of default=nw=1 " + shell_quote(path) + " 2>" OV_DEVNULL;
+    FILE* p = OV_POPEN(cmd.c_str(), "r");
     if (!p) die("failed to run ffprobe");
     VideoInfo vi;
     char line[256];
@@ -307,7 +333,7 @@ VideoInfo probe_video(const std::string& path) {
             else vi.fps = std::atof(v->c_str());
         }
     }
-    pclose(p);
+    OV_PCLOSE(p);
     if (vi.width <= 0 || vi.height <= 0) die("ffprobe could not read video: " + path);
     if (vi.fps <= 0) vi.fps = 30.0;
     return vi;
@@ -321,8 +347,10 @@ public:
         std::ostringstream cmd;
         cmd << "ffmpeg -v error -i " << shell_quote(video)
             << " -vf \"select=not(mod(n\\," << step << "))\" -fps_mode vfr"
-            << " -f rawvideo -pix_fmt bgr24 - 2>/dev/null";
-        pipe_ = popen(cmd.str().c_str(), "r");
+            << " -f rawvideo -pix_fmt bgr24 - 2>" OV_DEVNULL;
+        // Binary read mode on Windows (CRLF translation would corrupt the
+        // rawvideo byte stream); plain "r" on POSIX, which glibc requires.
+        pipe_ = OV_POPEN(cmd.str().c_str(), OV_PIPE_READ);
         if (!pipe_) die("failed to start ffmpeg");
         worker_ = std::thread([this] { run(); });
     }
@@ -331,7 +359,7 @@ public:
         stop_.store(true);
         cv_space_.notify_all();
         if (worker_.joinable()) worker_.join();
-        if (pipe_) pclose(pipe_);
+        if (pipe_) OV_PCLOSE(pipe_);
     }
 
     // Returns false at end of stream.
@@ -598,9 +626,25 @@ int main(int argc, char** argv) {
     VideoInfo vi = probe_video(args.video);
 
     ov::Core core;
-    ov::CompiledModel compiled = core.compile_model(
-        model_xml, args.device,
-        ov::hint::performance_mode(ov::hint::PerformanceMode::THROUGHPUT));
+    auto compile_on = [&](const std::string& dev) {
+        return core.compile_model(
+            model_xml, dev,
+            ov::hint::performance_mode(ov::hint::PerformanceMode::THROUGHPUT));
+    };
+    ov::CompiledModel compiled;
+    try {
+        compiled = compile_on(args.device);
+    } catch (const std::exception& e) {
+        if (args.device != "CPU") {
+            std::fprintf(stderr,
+                         "fast_detector: device '%s' unavailable (%s); falling back to CPU\n",
+                         args.device.c_str(), e.what());
+            args.device = "CPU";
+            compiled = compile_on("CPU");
+        } else {
+            throw;
+        }
+    }
     uint32_t nireq = 4;
     try {
         nireq = compiled.get_property(ov::optimal_number_of_infer_requests);

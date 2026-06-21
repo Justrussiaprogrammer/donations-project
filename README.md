@@ -12,6 +12,11 @@
    проверенный вариант (llama.cpp + Qwen3-VL-8B, в том числе сборка под GPU Intel)
    описан в [llama_cpp_setup.md](llama_cpp_setup.md).
 
+## Какую VLM-модель выбрать
+
+Рекомендую брать Qwen3-VL-8B (Q4_K_M, `--image-min-tokens 1024`).
+Эта модель дает достаточное качество распознавания, не требуя для себя слишком много ресурсов.
+
 ## Настройка среды
 
 Нужен только Python3 и зависимости из `requirements.txt` - больше для подготовки ничего ставить не требуется.
@@ -39,12 +44,20 @@ sudo apt update
 sudo apt install python3 python3-venv libgl1 -y
 ```
 
-Для работы скрипта fast_script.py (по умолчанию) нужно установить дополнительные зависимости:
+Для cpp-движка `fast_pipeline.py` (он по умолчанию) нужны дополнительные системные
+зависимости — компилятор C++, CMake и ffmpeg. Движок кроссплатформенный (Linux /
+macOS / Windows), OpenVINO берётся из pip-пакета в `donate_env`:
 
 ```bash
-sudo apt update
-sudo apt install g++ ffmpeg -y
+# Ubuntu
+sudo apt update && sudo apt install -y g++ cmake ffmpeg
+# macOS (Homebrew); компилятор — из Xcode Command Line Tools
+brew install cmake ffmpeg
+# Windows: Visual Studio Build Tools (C++), CMake и ffmpeg (добавить в PATH)
 ```
+
+Если cpp-движок не нужен, запускайте с `--engine py` — тогда дополнительных
+системных зависимостей не требуется.
 
 Запустите терминал из папки проекта и создайте окружение:
 
@@ -68,11 +81,14 @@ pip install -r requirements.txt
 ```bash
 source donate_env/bin/activate
 
-python3 scripts/fast_pipeline.py --video video_tests/stream.mp4 \
-  --frame-step 10 --conf 0.25 \
+python3 scripts/fast_pipeline.py --video stream.mp4 \
+  --frame-step 10 --conf 0.5 \
   --vlm-server-url http://127.0.0.1:8081/v1/chat/completions \
   --vlm-model Qwen3-VL --overwrite
 ```
+
+В `--video` укажите любой путь к вашему видео — абсолютный или относительный
+к корню проекта (`путь/к/видео.mp4` выше — это плейсхолдер, подставьте свой файл).
 
 Результаты прогона появятся в `vlm_runs/<имя_прогона>/`: `events_summary.csv`,
 `totals_by_currency.csv`, `donations.jsonl`, `run_metadata.json` и папка `events/`
@@ -82,17 +98,61 @@ python3 scripts/fast_pipeline.py --video video_tests/stream.mp4 \
 
 `fast_pipeline.py` поддерживает два движка YOLO-стадии (флаг `--engine`):
 
-- **`cpp`** (по умолчанию) - быстрый нативный детектор. Требует дополнительно:
-  - системные `g++` и `ffmpeg`: `sudo apt install -y g++ ffmpeg`;
+- **`cpp`** (по умолчанию) - быстрый нативный детектор (C++/OpenVINO),
+  кроссплатформенный (Linux / macOS / Windows). Требует дополнительно:
+  - системные компилятор C++, `cmake` и `ffmpeg` (см. раздел установки выше);
   - экспорт модели в OpenVINO в `models/best_openvino_model/`:
     `python3 -c "from ultralytics import YOLO; YOLO('models/best.pt').export(format='openvino', half=True, dynamic=False, imgsz=640)"`;
-  - однократную сборку бинарника: `./cpp/build.sh`.
-  - Для запуска на GPU добавьте к запуску `--cpp-device GPU`.
+  - однократную сборку бинарника:
+    - Linux/macOS: `./cpp/build.sh`
+    - Windows: `cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release` затем
+      `cmake --build cpp/build --config Release` (запускать из активированного
+      `donate_env`, чтобы OpenVINO-DLL были в PATH);
+  - для запуска на GPU добавьте `--cpp-device GPU` (если GPU недоступен —
+    автоматический откат на CPU с предупреждением в stderr).
 - **`py`** - эталонный Python-движок, без дополнительных системных зависимостей.
-  Работает с `models/best.pt` напрямую: добавьте к запуску `--engine py`.
+  Работает с `models/best.pt` (torch) напрямую: добавьте `--engine py`. Может
+  работать и с OpenVINO-экспортом (`--model models/best_openvino_model`) — тогда
+  устройство указывается явно: `--device intel:cpu` или `--device intel:gpu`.
 
 По умолчанию VLM работает параллельно с детекцией; флаг `--sequential` запускает
 сначала всю детекцию, затем весь VLM (полезно для чистого замера времени стадий).
+
+### Сбор данных для дообучения детектора
+
+Отдельный режим, чтобы улучшать сам YOLO-детектор (только движок `py` — добавьте
+`--engine py`). При любой выбранной стратегии VLM-стадия автоматически пропускается
+(`--skip-vlm` включается принудительно, об этом печатается сообщение) — сервер VLM
+для сбора данных не нужен. В отличие от сохранения «лучших»
+кропов (те — для VLM/OCR), здесь пишутся **полные кадры + YOLO-разметка +
+аннотированные превью** в `<прогон>/training_data/` (`images/`, `labels/`,
+`previews/`), готовые к дообучению в ultralytics. Боксы детектора — это
+псевдо-разметка, которую вы потом поправляете вручную (превью — для быстрой проверки).
+
+Стратегии выбора кадров (`--train-select`, через запятую):
+
+- `uncertain` — «слабые срабатывания»: детекция с `conf` в `[--train-uncertain-min, --conf)`. Детектор обычно не показывает боксы ниже `--conf`, поэтому при включённой `uncertain` детекция запускается на пониженном пороге `--train-uncertain-min`: боксы `>= --conf` остаются донатами (события не меняются), а боксы из `[min, conf)` идут только в обучающую выборку — как кандидаты в негативы для ручной проверки. В разметку такого кадра попадают только уверенные боксы; слабые видно на превью (с их confidence) — человек решает, поднять их в позитивы или оставить фоном.
+- `worst` — самые слабые из принятых детекций (`conf >= --conf`) внутри каждого события (`--train-worst-per-event` штук на событие).
+- `negatives` — кадры, где модель вообще не сработала (ни одного бокса) — чистые негативы, снижают ложные срабатывания; иначе просто выбрасываются.
+- `random` — случайные кадры **из событий донатов** (не лучшие и не худшие) — разнообразные позитивы.
+
+`uncertain` / `negatives` / `random` ограничены `--train-budget` кадрами на
+стратегию (reservoir-сэмплинг, диск не переполняется на длинных стримах).
+
+```bash
+python3 scripts/fast_pipeline.py --engine py --model models/best_openvino_model \
+  --video путь/к/видео.mp4 --device intel:cpu --skip-vlm --conf 0.5 \
+  --train-select uncertain,negatives,random --train-uncertain-min 0.25 \
+  --train-budget 300 --overwrite
+```
+
+| Флаг | По умолчанию | Что делает |
+| --- | --- | --- |
+| `--train-select` | (выкл.) | Список стратегий через запятую: `uncertain,worst,negatives,random`. Пусто — сбор выключен. |
+| `--train-dir` | `<output_dir>/training_data` | Куда складывать обучающие кадры. |
+| `--train-budget` | `200` | Лимит кадров на стратегию (reservoir) для `uncertain`/`negatives`/`random`. |
+| `--train-worst-per-event` | `2` | Сколько худших кадров сохранять на событие (`worst`). |
+| `--train-uncertain-min` | `0.25` | Нижняя граница confidence для `uncertain` (верхняя = `--conf`). При включённой `uncertain` детекция идёт на этом пороге. |
 
 ## Флаги
 
@@ -114,7 +174,7 @@ python3 scripts/fast_pipeline.py --video video_tests/stream.mp4 \
 
 | Флаг | По умолчанию | Что делает |
 | --- | --- | --- |
-| `--device` | `cpu` | Устройство torch для **py-движка**: `cpu` или индекс CUDA (`0`). На cpp-движок не влияет (см. `--cpp-device`). |
+| `--device` | `cpu` | Устройство **py-движка**, передаётся в ultralytics как есть. Для `.pt`-модели — `cpu` или CUDA-индекс (`0`, `cuda:0`); для OpenVINO-модели — `intel:cpu` / `intel:gpu` / `intel:npu`. На cpp-движок не влияет (см. `--cpp-device`). |
 | `--img-size` | `640` | Размер входного изображения YOLO. |
 | `--conf` | `0.5` | Порог уверенности детектора (ниже - отбрасывается). |
 | `--frame-step` | `10` | Обрабатывать каждый N-й кадр (10 = каждый десятый). |
@@ -161,38 +221,38 @@ python3 scripts/fast_pipeline.py --video video_tests/stream.mp4 \
 Рекомендуемый прогон - быстрый cpp-движок на CPU, VLM параллельно с детекцией:
 
 ```bash
-python3 scripts/fast_pipeline.py --video video_tests/stream.mp4
+python3 scripts/fast_pipeline.py --video путь/к/видео.mp4
 ```
 
 То же с помощью GPU (детекция на GPU через OpenVINO):
 
 ```bash
-python3 scripts/fast_pipeline.py --video video_tests/stream.mp4 --cpp-device GPU
+python3 scripts/fast_pipeline.py --video путь/к/видео.mp4 --cpp-device GPU
 ```
 
 Последовательный режим (вся детекция, затем весь VLM) - для чистого замера времени
 каждой стадии:
 
 ```bash
-python3 scripts/fast_pipeline.py --video video_tests/stream.mp4 --sequential --overwrite
+python3 scripts/fast_pipeline.py --video путь/к/видео.mp4 --sequential --overwrite
 ```
 
 Проверка только детектора без VLM (сервер поднимать не нужно):
 
 ```bash
-python3 scripts/fast_pipeline.py --video video_tests/stream.mp4 --skip-vlm
+python3 scripts/fast_pipeline.py --video путь/к/видео.mp4 --skip-vlm
 ```
 
 Эталонный Python-движок (без cpp-сборки, работает с `models/best.pt` напрямую):
 
 ```bash
-python3 scripts/fast_pipeline.py --engine py --video video_tests/stream.mp4 --overwrite
+python3 scripts/fast_pipeline.py --engine py --video путь/к/видео.mp4 --overwrite
 ```
 
 Прямой запуск эталонного пайплайна (минуя `fast_pipeline.py`):
 
 ```bash
-python3 scripts/vlm_pipeline.py --model models/best.pt --video video_tests/stream.mp4 \
+python3 scripts/vlm_pipeline.py --model models/best.pt --video путь/к/видео.mp4 \
   --device cpu --frame-step 10 --conf 0.25 --img-size 640 \
   --vlm-server-url http://127.0.0.1:8081/v1/chat/completions \
   --vlm-model Qwen3-VL --overwrite

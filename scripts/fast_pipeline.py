@@ -19,7 +19,7 @@
       весь VLM. Даёт чистый раздельный тайминг стадий для сравнения.
 
 Примеры:
-  python3 scripts/fast_pipeline.py --video video_tests/test_fragment.mp4 \
+  python3 scripts/fast_pipeline.py --video test/video/test_fragment.mp4 \
       --conf 0.25 --overwrite                       # cpp + параллельный VLM
   python3 scripts/fast_pipeline.py --video ... --sequential --overwrite
   python3 scripts/fast_pipeline.py --engine py --video ... --overwrite
@@ -124,6 +124,12 @@ def run_py_engine() -> None:
 
 
 def run_cpp_engine(args: argparse.Namespace) -> None:
+    if getattr(args, "train_select", "").strip():
+        raise SystemExit(
+            "Сбор обучающих данных (--train-select) поддерживается только движком py "
+            "(он держит кандидатов в памяти). Запустите с --engine py."
+        )
+
     project_dir = Path(args.project_dir).expanduser().resolve()
 
     model_path = Path(args.model)
@@ -140,9 +146,11 @@ def run_cpp_engine(args: argparse.Namespace) -> None:
     binary = Path(args.cpp_binary)
     if not binary.is_absolute():
         binary = project_dir / binary
+    if not binary.exists() and binary.with_suffix(".exe").exists():
+        binary = binary.with_suffix(".exe")  # Windows
     if not binary.exists():
         raise FileNotFoundError(
-            f"Бинарник не найден: {binary}\nСоберите его: ./cpp/build.sh"
+            f"Бинарник не найден: {binary}\nСоберите его: ./cpp/build.sh (Windows: cmake, см. README)"
         )
 
     run_name = args.run_name or f"{vp.safe_filename(video_path.stem)}_vlm_v5_run"
