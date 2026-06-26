@@ -82,6 +82,7 @@ struct Args {
     float event_gap_sec = 3.0f;
     float event_iou_thr = 0.25f;
     float event_center_thr = 0.05f;
+    float event_split_height_frac = 0.10f;  // plaque-swap guard (see find_matching_event)
     int keep_top_candidates = 3;
     long max_processed_frames = 0;
     bool no_save_images = false;
@@ -114,6 +115,7 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--event-gap-sec") a.event_gap_sec = std::stof(need(i));
         else if (k == "--event-iou-thr") a.event_iou_thr = std::stof(need(i));
         else if (k == "--event-center-thr") a.event_center_thr = std::stof(need(i));
+        else if (k == "--event-split-height-frac") a.event_split_height_frac = std::stof(need(i));
         else if (k == "--keep-top-candidates") a.keep_top_candidates = std::stoi(need(i));
         else if (k == "--max-processed-frames") a.max_processed_frames = std::stol(need(i));
         else if (k == "--no-save-images") a.no_save_images = true;
@@ -137,6 +139,26 @@ int clampi(int v, int lo, int hi) { return std::max(lo, std::min(v, hi)); }
 
 long box_area(const Box& b) {
     return (long)std::max(0, b.x2 - b.x1) * std::max(0, b.y2 - b.y1);
+}
+
+constexpr size_t RECENT_HEIGHTS_MAXLEN = 5;
+
+int box_height(const Box& b) { return b.y2 - b.y1; }
+
+// Median height of an event's recent detections — reference geometry for the
+// plaque-swap guard. Mirrors vlm_pipeline.reference_height 1:1: sort ascending,
+// take element at index n/2 (upper of the two middles for even counts), so both
+// engines decide identically.
+int reference_height(const std::vector<int>& heights) {
+    if (heights.empty()) return 0;
+    std::vector<int> s = heights;
+    std::sort(s.begin(), s.end());
+    return s[s.size() / 2];
+}
+
+void push_recent_height(std::vector<int>& heights, int h) {
+    heights.push_back(h);
+    if (heights.size() > RECENT_HEIGHTS_MAXLEN) heights.erase(heights.begin());
 }
 
 double box_iou(const Box& a, const Box& b) {
@@ -406,18 +428,18 @@ private:
 
 struct Letterbox { double r; int left, top; };
 
-Letterbox letterbox_into(const uint8_t* bgr, int w, int h, int s, float* chw) {
-    double r = std::min((double)s / w, (double)s / h);
+Letterbox letterbox_into(const uint8_t* bgr, int w, int h, int sw, int sh, float* chw) {
+    double r = std::min((double)sw / w, (double)sh / h);
     int nw = (int)std::lround(w * r), nh = (int)std::lround(h * r);
-    double dw = (s - nw) / 2.0, dh = (s - nh) / 2.0;
+    double dw = (sw - nw) / 2.0, dh = (sh - nh) / 2.0;
     int left = (int)std::lround(dw - 0.1), top = (int)std::lround(dh - 0.1);
 
     const float pad = 114.0f / 255.0f;
-    std::fill(chw, chw + (size_t)3 * s * s, pad);
+    std::fill(chw, chw + (size_t)3 * sw * sh, pad);
 
     float* rp = chw;                       // RGB planes
-    float* gp = chw + (size_t)s * s;
-    float* bp = chw + (size_t)2 * s * s;
+    float* gp = chw + (size_t)sw * sh;
+    float* bp = chw + (size_t)2 * sw * sh;
 
     // bilinear resize of the w*h source into the nw*nh region at (left, top)
     double sx = (double)w / nw, sy = (double)h / nh;
@@ -428,7 +450,7 @@ Letterbox letterbox_into(const uint8_t* bgr, int w, int h, int s, float* chw) {
         double wy = fy - y0;
         int y1 = std::min(y0 + 1, h - 1);
         y0 = std::max(y0, 0);
-        size_t row = (size_t)(top + y) * s + left;
+        size_t row = (size_t)(top + y) * sw + left;
         const uint8_t* r0 = bgr + (size_t)y0 * w * 3;
         const uint8_t* r1 = bgr + (size_t)y1 * w * 3;
         for (int x = 0; x < nw; ++x) {
@@ -518,12 +540,23 @@ struct Event {
     int best_frame_idx = 0;
     bool emitted = false;  // streaming: already sent to stdout, don't resend
     std::vector<Candidate> candidates;
+    std::vector<int> recent_heights;  // reference geometry for the plaque-swap guard
 };
 
+// Port of vlm_pipeline.find_matching_event, including the plaque-swap guard
+// (split_height_frac > 0): two donations shown back-to-back in the same overlay
+// slot overlap heavily (high IoU), so geometry alone merges them and the second is
+// lost; but the box height jumps when the plaque is replaced (different message
+// length) while staying ~stable within one donation. A candidate whose height
+// differs from the event's reference height by more than split_height_frac is
+// treated as a DIFFERENT plaque and does not match. The decision uses only integer
+// box coords (identical in both engines), so cpp/py output stays in sync.
 Event* find_matching_event(std::vector<Event*>& events, const Box& box, int w, int h,
-                           float iou_thr, float center_thr, int current_frame_idx) {
+                           float iou_thr, float center_thr, int current_frame_idx,
+                           float split_height_frac) {
     Event* best = nullptr;
     double best_score = -999.0;
+    int box_h = box_height(box);
     for (Event* ev : events) {
         double iou = box_iou(ev->last_box, box);
         double dist = center_distance_norm(ev->last_box, box, w, h);
@@ -531,6 +564,11 @@ Event* find_matching_event(std::vector<Event*>& events, const Box& box, int w, i
             if (iou < iou_thr) continue;  // same frame: IoU only
         } else {
             if (iou < iou_thr && dist > center_thr) continue;
+        }
+        if (split_height_frac > 0.0f) {
+            int ref_h = reference_height(ev->recent_heights);
+            if (ref_h > 0 && std::abs(box_h - ref_h) > split_height_frac * ref_h)
+                continue;  // plaque height changed → different donation, don't merge
         }
         double score = iou - dist;
         if (score > best_score) { best_score = score; best = ev; }
@@ -650,8 +688,9 @@ int main(int argc, char** argv) {
         nireq = compiled.get_property(ov::optimal_number_of_infer_requests);
     } catch (...) {}
     nireq = std::max(1u, std::min(nireq, 8u));
-    ov::Shape in_shape = compiled.input().get_shape();  // [1,3,S,S]
-    int S = (int)in_shape[3];
+    ov::Shape in_shape = compiled.input().get_shape();  // [1,3,SH,SW]
+    int SH = (int)in_shape[2];   // network input height
+    int SW = (int)in_shape[3];   // network input width (may differ -> rect input)
 
     std::string video_name = args.video;
     if (auto pos = video_name.find_last_of('/'); pos != std::string::npos)
@@ -664,7 +703,7 @@ int main(int argc, char** argv) {
     if (!args.quiet) {
         std::fprintf(logf, "fast_detector: %s %dx%d @ %.3f fps, %ld frames, step %d, device %s, input %dx%d\n",
                      video_name.c_str(), vi.width, vi.height, vi.fps, vi.nb_frames,
-                     args.frame_step, args.device.c_str(), S, S);
+                     args.frame_step, args.device.c_str(), SW, SH);
         std::fflush(logf);
     }
 
@@ -684,7 +723,7 @@ int main(int argc, char** argv) {
     std::vector<Slot> slots(nireq);
     for (auto& s : slots) {
         s.req = compiled.create_infer_request();
-        s.input.resize((size_t)3 * S * S);
+        s.input.resize((size_t)3 * SW * SH);
         s.req.set_input_tensor(ov::Tensor(ov::element::f32, in_shape, s.input.data()));
     }
 
@@ -717,7 +756,7 @@ int main(int argc, char** argv) {
             t_read += std::chrono::duration<double>(std::chrono::steady_clock::now() - tr0).count();
             s.frame_idx = submitted * args.frame_step;
             ++submitted;
-            s.lb = letterbox_into(s.frame.data(), w, h, S, s.input.data());
+            s.lb = letterbox_into(s.frame.data(), w, h, SW, SH, s.input.data());
             s.req.start_async();
             tail = (tail + 1) % nireq;
             ++in_flight;
@@ -819,7 +858,7 @@ int main(int argc, char** argv) {
 
                 Event* matched = find_matching_event(active, base_box, w, h,
                                                      args.event_iou_thr, args.event_center_thr,
-                                                     (int)frame_idx);
+                                                     (int)frame_idx, args.event_split_height_frac);
                 if (!matched) {
                     all_events.push_back(Event{});
                     matched = &all_events.back();
@@ -832,6 +871,7 @@ int main(int argc, char** argv) {
                 matched->last_frame = (int)frame_idx;
                 matched->last_box = base_box;
                 matched->detections_count += 1;
+                push_recent_height(matched->recent_heights, box_height(base_box));
                 if (conf >= matched->best_confidence) {
                     matched->best_confidence = conf;
                     matched->best_timestamp_sec = timestamp;

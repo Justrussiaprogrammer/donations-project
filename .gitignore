@@ -1,9 +1,12 @@
 models
 test
+test_ocr
 donate_env
 vlm_runs
 ocr_runs
 __pycache__
+*.egg-info
+build
 cpp/fast_detector
 cpp/fast_detector.exe
 cpp/build

@@ -1,7 +1,12 @@
-# Зависимости для обоих движков (py и cpp).
-# cv2/numpy подтягиваются транзитивно через ultralytics.
-# Для cpp-движка дополнительно нужны системные g++ и ffmpeg,
-# затем сборка ./cpp/build.sh — openvino ниже даёт и C++ заголовки, и экспорт модели.
-ultralytics
-requests
-openvino
+# Установка проекта одной командой:
+#   pip install -r requirements.txt
+#
+# Это ставит пакет donsearcher в editable-режиме (-e .) вместе со всеми
+# Python-зависимостями, объявленными в pyproject.toml ([project.dependencies]:
+# ultralytics, requests, openvino; cv2/numpy подтягиваются транзитивно).
+# После этого `import donsearcher` и команда `donsearcher` работают из любого
+# каталога без правки sys.path.
+#
+# Для cpp-движка дополнительно нужны системные g++ и ffmpeg, затем сборка
+# ./cpp/build.sh (openvino выше даёт и C++ заголовки, и экспорт модели).
+-e .

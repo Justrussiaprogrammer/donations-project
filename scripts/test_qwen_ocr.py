@@ -7,7 +7,7 @@ import cv2
 
 from difflib import SequenceMatcher
 
-import vlm_pipeline
+import donsearcher
 
 IMAGE_FOLDER = "test/gt/donations"
 SERVER_URL = "http://127.0.0.1:8081/v1/chat/completions"
@@ -18,7 +18,7 @@ MODEL_NAME = "Qwen3-VL-8B-Q4_K_M"
 # сравнивать промпты тем же каноническим eval'ом. ВАЖНО: раньше скрипт молча брал
 # только VLM_PROMPT, и прогон под другим --model-name всё равно использовал продакшн-
 # промпт — отсюда путаница «v10 == v7». Теперь промпт явный.
-PROMPT = vlm_pipeline.VLM_PROMPT
+PROMPT = donsearcher.VLM_PROMPT
 
 TRUTH_OCR_FILE = Path("test/gt/true_ocr.json")
 TEST_OCR_FILE = Path("test_ocr.jsonl")
@@ -32,7 +32,7 @@ def save_jsons_from_model(folder, out_folder, server_url=SERVER_URL, model_name=
     for img_path in image_files:
         print(f"Обрабатываю: {img_path.name}")
 
-        raw_text, parsed, error = vlm_pipeline.call_vlm_for_image(
+        raw_text, parsed, error = donsearcher.call_vlm_for_image(
             crop_bgr=cv2.imread(str(img_path)),
             server_url=server_url,
             model_name=model_name,
@@ -57,7 +57,7 @@ def save_jsons_from_model(folder, out_folder, server_url=SERVER_URL, model_name=
         })
     
     print("Модель проанализировала все изображения")
-    vlm_pipeline.write_jsonl(out_folder, summary_data)
+    donsearcher.write_jsonl(out_folder, summary_data)
     print("Все json донатов сохранены")
 
 
@@ -156,11 +156,12 @@ def main():
         print(f"Обрабатываю: {img_path.name}")
 
         _t0 = time.perf_counter()
-        raw_text, parsed, error = vlm_pipeline.call_vlm_for_image(
+        raw_text, parsed, error = donsearcher.call_vlm_for_image(
             crop_bgr=cv2.imread(str(img_path)),
             server_url=SERVER_URL,
             model_name=MODEL_NAME,
-            prompt=PROMPT
+            prompt=PROMPT,
+            timeout_sec=1000
         )
         latency_sec = time.perf_counter() - _t0
         print(f"  ⏱ {latency_sec:.2f} с")
@@ -311,7 +312,7 @@ if __name__ == "__main__":
     parser.add_argument("--server-url", default=SERVER_URL)
     parser.add_argument("--model-name", default=MODEL_NAME)
     parser.add_argument("--prompt-file", default=None,
-                        help="файл с промптом (по умолчанию — встроенный vlm_pipeline.VLM_PROMPT)")
+                        help="файл с промптом (по умолчанию — встроенный donsearcher.VLM_PROMPT)")
     parser.add_argument("--out", default=str(TEST_OCR_FILE), help="выходной JSONL (для --mode dump)")
     a = parser.parse_args()
 

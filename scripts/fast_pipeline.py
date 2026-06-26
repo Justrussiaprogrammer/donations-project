@@ -4,13 +4,13 @@
 
   --engine cpp (по умолчанию) — нативный детектор cpp/fast_detector
       (OpenVINO C++, ffmpeg-декодирование). Выходные файлы идентичны
-      vlm_pipeline.py: events_summary.csv, totals_by_currency.csv,
+      py-движку: events_summary.csv, totals_by_currency.csv,
       donations.jsonl, run_metadata.json, events/.
 
-  --engine py — просто запускает scripts/vlm_pipeline.py с теми же аргументами
-      (эталонная реализация).
+  --engine py — просто запускает `python -m donsearcher` с теми же аргументами
+      (эталонная реализация, donsearcher/pipeline.py).
 
-Режим VLM (как в vlm_pipeline.py):
+Режим VLM (как в py-движке):
   по умолчанию — ПАРАЛЛЕЛЬНО: cpp-детектор стримит закрытые события на stdout
       по мере их закрытия, Python-воркер тут же гонит их через VLM, пока
       детекция ещё идёт. Для длинных стримов, где VLM — узкое место, это
@@ -20,7 +20,7 @@
 
 Примеры:
   python3 scripts/fast_pipeline.py --video test/video/test_fragment.mp4 \
-      --conf 0.25 --overwrite                       # cpp + параллельный VLM
+      --conf 0.5 --overwrite                        # cpp + параллельный VLM
   python3 scripts/fast_pipeline.py --video ... --sequential --overwrite
   python3 scripts/fast_pipeline.py --engine py --video ... --overwrite
   python3 scripts/fast_pipeline.py --video ... --skip-vlm   # только детекция
@@ -41,10 +41,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-SCRIPTS_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(SCRIPTS_DIR))
-
-import vlm_pipeline as vp  # noqa: E402
+import donsearcher as vp
 
 
 def resolve_openvino_model(model_path: Path, project_dir: Path) -> Path:
@@ -58,7 +55,7 @@ def resolve_openvino_model(model_path: Path, project_dir: Path) -> Path:
         f"Для --engine cpp нужен OpenVINO-экспорт модели, не найден: {candidate}\n"
         "Сделайте экспорт:\n"
         f'  python3 -c "from ultralytics import YOLO; '
-        f"YOLO('{model_path}').export(format='openvino', half=True, dynamic=False, imgsz=640)\""
+        f"YOLO('{model_path}').export(format='openvino', half=True, dynamic=False, imgsz=[384,640])\""
     )
 
 
@@ -119,7 +116,10 @@ def run_py_engine() -> None:
         if a.startswith(("--engine=", "--cpp-binary=", "--cpp-device=")):
             continue
         passthrough.append(a)
-    cmd = [sys.executable, str(SCRIPTS_DIR / "vlm_pipeline.py")] + passthrough
+    # Делегируем py-движку через `python -m donsearcher` (тот же интерпретатор,
+    # пакет установлен editable). cwd НЕ меняем, чтобы относительные пути
+    # (--video и т.п.) разрешались от каталога вызова.
+    cmd = [sys.executable, "-m", "donsearcher"] + passthrough
     raise SystemExit(subprocess.call(cmd))
 
 
@@ -153,7 +153,7 @@ def run_cpp_engine(args: argparse.Namespace) -> None:
             f"Бинарник не найден: {binary}\nСоберите его: ./cpp/build.sh (Windows: cmake, см. README)"
         )
 
-    run_name = args.run_name or f"{vp.safe_filename(video_path.stem)}_vlm_v5_run"
+    run_name = args.run_name or f"{vp.safe_filename(video_path.stem)}_vlm_v6_run"
     output_dir = (project_dir / args.output_dir / run_name).resolve()
     events_dir = output_dir / "events"
     crops_dir = events_dir / "best_crops"
@@ -198,6 +198,7 @@ def run_cpp_engine(args: argparse.Namespace) -> None:
         "--event-gap-sec", str(args.event_gap_sec),
         "--event-iou-thr", str(args.event_iou_thr),
         "--event-center-thr", str(args.event_center_thr),
+        "--event-split-height-frac", str(args.event_split_height_frac),
         "--keep-top-candidates", str(args.keep_top_candidates),
         "--max-processed-frames", str(args.max_processed_frames),
         "--tmp-dir", str(tmp_dir),
@@ -225,6 +226,8 @@ def run_cpp_engine(args: argparse.Namespace) -> None:
     vlm_results.sort(key=lambda r: r[0]["event_id"])
     event_rows = [r[0] for r in vlm_results]
     jsonl_rows = [r[1] for r in vlm_results]
+
+    duplicate_events = vp.dedup_events(event_rows, jsonl_rows)
 
     shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -264,6 +267,7 @@ def run_cpp_engine(args: argparse.Namespace) -> None:
                 "event_gap_sec": args.event_gap_sec,
                 "event_iou_thr": args.event_iou_thr,
                 "event_center_thr": args.event_center_thr,
+                "event_split_height_frac": args.event_split_height_frac,
                 "vlm_server_url": args.vlm_server_url,
                 "vlm_model": args.vlm_model,
                 "vlm_prompt_version": vp.VLM_PROMPT_VERSION,
@@ -281,6 +285,12 @@ def run_cpp_engine(args: argparse.Namespace) -> None:
                 "vlm_elapsed_sec": vlm_elapsed,
                 "wall_elapsed_sec": wall_elapsed,
                 "totals_skipped_events": totals_skipped_events,
+                "dedup": {
+                    "duplicates_excluded": duplicate_events,
+                    "key": "donor+amount+currency+message (normalized, exact)",
+                    "generic_donors": sorted(vp.GENERIC_DONORS),
+                    "generic_messages": sorted(vp.GENERIC_MESSAGES),
+                },
                 "outputs": {
                     "events_summary_csv": str(events_csv),
                     "totals_by_currency_csv": str(totals_csv),
@@ -304,6 +314,8 @@ def run_cpp_engine(args: argparse.Namespace) -> None:
     print(f"  Sampled frames:    {det['sampled_frames_processed']}")
     print(f"  Raw detections:    {det['raw_detections']}")
     print(f"  Donation events:   {n_events}")
+    if duplicate_events:
+        print(f"  Duplicates excluded: {duplicate_events} re-shown donation(s)")
     if totals_skipped_events:
         print(f"  Excluded from totals: {totals_skipped_events} event(s)")
     print(f"Events summary:      {events_csv}")
@@ -435,7 +447,7 @@ def main() -> None:
     parser = vp.build_parser()
     parser.description = "Donation pipeline c выбором движка детекции (cpp/py)"
     parser.add_argument("--engine", choices=["cpp", "py"], default="cpp",
-                        help="cpp — нативный детектор (быстрый), py — vlm_pipeline.py")
+                        help="cpp — нативный детектор (быстрый), py — python -m donsearcher")
     parser.add_argument("--cpp-binary", default="cpp/fast_detector",
                         help="Путь к собранному fast_detector")
     parser.add_argument("--cpp-device", default="CPU",

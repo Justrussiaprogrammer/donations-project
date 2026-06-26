@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "donsearcher"
+version = "0.2.0"
+description = "Извлечение данных о донатах из видеозаписей стримов (YOLO-детектор + локальный VLM)."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "ultralytics",   # тянет cv2/numpy/torch транзитивно
+    "requests",
+    "openvino",      # C++ заголовки для cpp-движка + экспорт модели
+]
+
+# `python -m donsearcher` и команда `donsearcher` — точка входа py-движка.
+[project.scripts]
+donsearcher = "donsearcher.pipeline:main"
+
+[tool.setuptools]
+# Только пакет с логикой; служебные скрипты (scripts/) и нативный детектор (cpp/)
+# не упаковываются.
+packages = ["donsearcher"]

@@ -101,8 +101,10 @@ python3 scripts/fast_pipeline.py --video stream.mp4 \
 - **`cpp`** (по умолчанию) - быстрый нативный детектор (C++/OpenVINO),
   кроссплатформенный (Linux / macOS / Windows). Требует дополнительно:
   - системные компилятор C++, `cmake` и `ffmpeg` (см. раздел установки выше);
-  - экспорт модели в OpenVINO в `models/best_openvino_model/`:
-    `python3 -c "from ultralytics import YOLO; YOLO('models/best.pt').export(format='openvino', half=True, dynamic=False, imgsz=640)"`;
+  - экспорт модели в OpenVINO в `models/best_openvino_model/` (прямоугольный
+    вход 384×640 под кадр 16:9 — на ~30% быстрее квадратного 640×640 при том же
+    выходе, т.к. не тратит компьют на чёрные поля леттербокса):
+    `python3 -c "from ultralytics import YOLO; YOLO('models/best.pt').export(format='openvino', half=True, dynamic=False, imgsz=[384,640])"`;
   - однократную сборку бинарника:
     - Linux/macOS: `./cpp/build.sh`
     - Windows: `cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release` затем
@@ -156,8 +158,8 @@ python3 scripts/fast_pipeline.py --engine py --model models/best_openvino_model 
 
 ## Флаги
 
-`fast_pipeline.py` принимает **все** флаги `vlm_pipeline.py` плюс три собственных
-(`--engine`, `--cpp-binary`, `--cpp-device`). Поэтому таблицы ниже относятся к обоим скриптам; раздел «Только fast_pipeline.py» - к нему одному.
+`fast_pipeline.py` принимает **все** флаги py-движка (`python -m donsearcher`) плюс три собственных
+(`--engine`, `--cpp-binary`, `--cpp-device`). Поэтому таблицы ниже относятся к обоим; раздел «Только fast_pipeline.py» - к нему одному.
 
 ### Пути и прогон
 
@@ -252,8 +254,8 @@ python3 scripts/fast_pipeline.py --engine py --video путь/к/видео.mp4 
 Прямой запуск эталонного пайплайна (минуя `fast_pipeline.py`):
 
 ```bash
-python3 scripts/vlm_pipeline.py --model models/best.pt --video путь/к/видео.mp4 \
-  --device cpu --frame-step 10 --conf 0.25 --img-size 640 \
+python3 -m donsearcher --model models/best.pt --video путь/к/видео.mp4 \
+  --device cpu --frame-step 10 --conf 0.5 --img-size 640 \
   --vlm-server-url http://127.0.0.1:8081/v1/chat/completions \
   --vlm-model Qwen3-VL --overwrite
 ```
