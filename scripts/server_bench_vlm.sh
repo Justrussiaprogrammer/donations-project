@@ -47,6 +47,15 @@ if [[ "${1:-}" == "--setup" ]]; then
     sudo apt-get update -qq
     sudo apt-get install -y -qq git cmake build-essential libcurl4-openssl-dev \
         python3-venv python3-dev
+    # llama.cpp с CUDA требует nvcc (CUDA toolkit), а не только драйвер. На «чистом»
+    # образе (не-Docker) с одним GPU-драйвером nvcc обычно нет — доставляем пакет
+    # Ubuntu. nvcc старее драйвера 580 — это НОРМА (драйвер обратно совместим).
+    if command -v nvidia-smi >/dev/null && ! command -v nvcc >/dev/null; then
+        echo "--- nvcc не найден: ставлю nvidia-cuda-toolkit (для сборки CUDA) ---"
+        sudo apt-get install -y -qq nvidia-cuda-toolkit \
+            || { echo "!! nvidia-cuda-toolkit не встал — поставьте CUDA toolkit вручную"; exit 1; }
+    fi
+    command -v nvcc >/dev/null && echo "nvcc: $(nvcc --version | tail -1)"
     if [[ ! -d "$LLAMA_DIR/.git" ]]; then
         git clone --depth 1 https://github.com/ggml-org/llama.cpp "$LLAMA_DIR"
     fi
