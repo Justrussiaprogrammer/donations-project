@@ -45,8 +45,10 @@ LLAMA_BIN="$LLAMA_DIR/build-cuda/bin/llama-server"
 if [[ "${1:-}" == "--setup" ]]; then
     command -v nvidia-smi >/dev/null || echo "!! нет nvidia-smi — будет только CPU-сборка смысл (GPU_LAYERS=0)"
     sudo apt-get update -qq
+    # libssl-dev ОБЯЗАТЕЛЕН: без него llama.cpp собирается без HTTPS и `-hf`
+    # не может скачать GGUF («HTTPS is not supported… rebuild with -DLLAMA_OPENSSL=ON»).
     sudo apt-get install -y -qq git cmake build-essential libcurl4-openssl-dev \
-        python3-venv python3-dev
+        libssl-dev python3-venv python3-dev
     # llama.cpp с CUDA требует nvcc (CUDA toolkit), а не только драйвер. На «чистом»
     # образе (не-Docker) с одним GPU-драйвером nvcc обычно нет — доставляем пакет
     # Ubuntu. nvcc старее драйвера 580 — это НОРМА (драйвер обратно совместим).
@@ -61,7 +63,7 @@ if [[ "${1:-}" == "--setup" ]]; then
     fi
     echo "--- сборка llama.cpp build-cuda (-DGGML_CUDA=ON; минуты) ---"
     cmake -S "$LLAMA_DIR" -B "$LLAMA_DIR/build-cuda" \
-        -DGGML_CUDA=ON -DLLAMA_CURL=ON -DCMAKE_BUILD_TYPE=Release
+        -DGGML_CUDA=ON -DLLAMA_CURL=ON -DLLAMA_OPENSSL=ON -DCMAKE_BUILD_TYPE=Release
     cmake --build "$LLAMA_DIR/build-cuda" -j"$(nproc)" --target llama-server
     # лёгкое venv для vlm_stage: donsearcher-хелперы (requests/Pillow), без torch
     python3 -m venv vlm_env
