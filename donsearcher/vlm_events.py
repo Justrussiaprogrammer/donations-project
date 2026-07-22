@@ -17,13 +17,59 @@ from typing import Any, Optional
 import cv2
 
 from .events import DonationEvent
-from .textutil import json_dumps_compact, seconds_to_timestamp
+from .reports import FULL_META_FIELDS
+from .textutil import json_dumps_compact, seconds_to_timestamp, unpack_images_schema
 from .vlm_client import call_vlm_for_image
 
 
-def _make_error_rows(ev: DonationEvent, error: str) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Rows for an event that produced no VLM result, so it still appears in CSV/JSONL."""
-    event_row: dict[str, Any] = {
+def build_event_rows(
+    meta: dict[str, Any],
+    raw_text: str,
+    parsed: Optional[dict[str, Any]],
+    model_error: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Собрать (event_row, jsonl_row) из детекторных метаданных и ответа VLM.
+
+    meta — словарь с полями FULL_META_FIELDS (отсутствующие -> ""). Единая точка
+    формата строк: её используют и обычный пайплайн (_process_event_vlm), и
+    отдельная VLM-стадия по готовым кропам (scripts/vlm_stage.py) — вывод обеих
+    схем запуска совпадает.
+    """
+    parsed_ok = parsed is not None
+    parsed = parsed or {}
+    event_row: dict[str, Any] = {k: meta.get(k, "") for k in FULL_META_FIELDS}
+    event_row.update({
+        "parsed_ok": parsed_ok,
+        "donor": parsed.get("donor", ""),
+        "amount": parsed.get("amount", ""),
+        "currency": parsed.get("currency", ""),
+        "message": parsed.get("message", ""),
+        "fee_covered": parsed.get("fee_covered", False),
+        "needs_review": parsed.get("needs_review", True),
+        "raw_model_response": raw_text,
+        "model_error": model_error,
+        "is_duplicate": False,
+        "duplicate_of_event_id": "",
+    })
+    jsonl_row: dict[str, Any] = {
+        "file_name": meta.get("crop_path", ""),
+        "parsed_ok": parsed_ok,
+        "error": model_error,
+        "donor": parsed.get("donor", ""),
+        "amount": parsed.get("amount", ""),
+        "currency": parsed.get("currency", ""),
+        "message": parsed.get("message", ""),
+        "fee_covered": parsed.get("fee_covered", False),
+        "needs_review": parsed.get("needs_review", True),
+        "is_duplicate": False,
+        "duplicate_of_event_id": "",
+    }
+    return event_row, jsonl_row
+
+
+def _event_meta(ev: DonationEvent, best_det: Any = None, crop_name: str = "") -> dict[str, Any]:
+    """Детекторные поля события (FULL_META_FIELDS) для build_event_rows."""
+    meta: dict[str, Any] = {
         "event_id": ev.event_id,
         "video_name": ev.video_name,
         "start_time": seconds_to_timestamp(ev.start_sec),
@@ -38,33 +84,20 @@ def _make_error_rows(ev: DonationEvent, error: str) -> tuple[dict[str, Any], dic
         "best_detection_score": "",
         "base_box_json": "",
         "padded_box_json": "",
-        "crop_path": "",
-        "parsed_ok": False,
-        "donor": "",
-        "amount": "",
-        "currency": "",
-        "message": "",
-        "fee_covered": False,
-        "needs_review": True,
-        "raw_model_response": "",
-        "model_error": error,
-        "is_duplicate": False,
-        "duplicate_of_event_id": "",
+        "crop_path": crop_name,
     }
-    jsonl_row: dict[str, Any] = {
-        "file_name": "",
-        "parsed_ok": False,
-        "error": error,
-        "donor": "",
-        "amount": "",
-        "currency": "",
-        "message": "",
-        "fee_covered": False,
-        "needs_review": True,
-        "is_duplicate": False,
-        "duplicate_of_event_id": "",
-    }
-    return event_row, jsonl_row
+    if best_det is not None:
+        meta["best_detection_time"] = seconds_to_timestamp(best_det.timestamp_sec)
+        meta["best_detection_frame"] = best_det.frame_idx
+        meta["best_detection_score"] = round(best_det.score, 4)
+        meta["base_box_json"] = json_dumps_compact(best_det.base_box)
+        meta["padded_box_json"] = json_dumps_compact(best_det.padded_box)
+    return meta
+
+
+def _make_error_rows(ev: DonationEvent, error: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Rows for an event that produced no VLM result, so it still appears in CSV/JSONL."""
+    return build_event_rows(_event_meta(ev), "", None, error)
 
 
 def _process_event_vlm(
@@ -83,18 +116,18 @@ def _process_event_vlm(
     detection_time = seconds_to_timestamp(best_det.timestamp_sec)
     detection_time_safe = detection_time.replace(":", "-")
 
-    if not args.no_save_images:
+    save_crops, save_annotated, save_original = unpack_images_schema(args.images_schema)
+    saved_crop_path = ""
+    if save_crops:
         best_crop_path = crops_dir / f"event_{ev.event_id:04d}_best_detector_crop.png"
-        best_frame_path = frames_dir / f"event_{ev.event_id:04d}_best_detector_frame.jpg"
-        best_original_frame_path = original_frames_dir / f"event_{ev.event_id:04d}_{detection_time_safe}.png"
         shutil.copy2(str(best_det.crop_path), str(best_crop_path))
-        if best_det.annotated_frame_path:
-            shutil.copy2(str(best_det.annotated_frame_path), str(best_frame_path))
-        if best_det.original_frame_path:
-            shutil.copy2(str(best_det.original_frame_path), str(best_original_frame_path))
         saved_crop_path = str(best_crop_path.name)
-    else:
-        saved_crop_path = ""
+    if save_annotated and best_det.annotated_frame_path:
+        best_frame_path = frames_dir / f"event_{ev.event_id:04d}_best_detector_frame.jpg"
+        shutil.copy2(str(best_det.annotated_frame_path), str(best_frame_path))
+    if save_original and best_det.original_frame_path:
+        best_original_frame_path = original_frames_dir / f"event_{ev.event_id:04d}_{detection_time_safe}.png"
+        shutil.copy2(str(best_det.original_frame_path), str(best_original_frame_path))
 
     crop_bgr = cv2.imread(str(best_det.crop_path))
 
@@ -112,54 +145,12 @@ def _process_event_vlm(
             timeout_sec=args.vlm_timeout,
             max_tokens=args.vlm_max_tokens,
             temperature=args.vlm_temperature,
+            prompt=getattr(args, "vlm_prompt_text", None),
             retries=args.vlm_retries,
         )
 
-    parsed_ok = parsed is not None
-    parsed = parsed or {}
-
-    event_row = {
-        "event_id": ev.event_id,
-        "video_name": ev.video_name,
-        "start_time": seconds_to_timestamp(ev.start_sec),
-        "end_time": seconds_to_timestamp(ev.end_sec),
-        "duration": seconds_to_timestamp(ev.end_sec - ev.start_sec),
-        "first_frame": ev.first_frame,
-        "last_frame": ev.last_frame,
-        "detections_count": ev.detections_count,
-        "best_detection_confidence": round(ev.best_confidence, 4),
-        "best_detection_time": detection_time,
-        "best_detection_frame": best_det.frame_idx,
-        "best_detection_score": round(best_det.score, 4),
-        "base_box_json": json_dumps_compact(best_det.base_box),
-        "padded_box_json": json_dumps_compact(best_det.padded_box),
-        "crop_path": saved_crop_path,
-        "parsed_ok": parsed_ok,
-        "donor": parsed.get("donor", ""),
-        "amount": parsed.get("amount", ""),
-        "currency": parsed.get("currency", ""),
-        "message": parsed.get("message", ""),
-        "fee_covered": parsed.get("fee_covered", False),
-        "needs_review": parsed.get("needs_review", True),
-        "raw_model_response": raw_text,
-        "model_error": model_error,
-        "is_duplicate": False,
-        "duplicate_of_event_id": "",
-    }
-    jsonl_row = {
-        "file_name": saved_crop_path,
-        "parsed_ok": parsed_ok,
-        "error": model_error,
-        "donor": parsed.get("donor", ""),
-        "amount": parsed.get("amount", ""),
-        "currency": parsed.get("currency", ""),
-        "message": parsed.get("message", ""),
-        "fee_covered": parsed.get("fee_covered", False),
-        "needs_review": parsed.get("needs_review", True),
-        "is_duplicate": False,
-        "duplicate_of_event_id": "",
-    }
-    return event_row, jsonl_row
+    meta = _event_meta(ev, best_det, saved_crop_path)
+    return build_event_rows(meta, raw_text, parsed, model_error)
 
 
 def _vlm_worker(

@@ -127,7 +127,11 @@ def build_totals_rows(event_rows: list[dict[str, Any]]) -> tuple[list[dict[str, 
         if not row.get("parsed_ok"):
             skipped += 1
             continue
-        if row.get("needs_review") is True or row.get("best_detection_confidence") < 0.5:
+        # Нечисловой conf ("" при minimal-метаданных VLM-стадии) — не фильтруем:
+        # порог по confidence уже применил детектор на YOLO-стадии.
+        conf = row.get("best_detection_confidence")
+        low_conf = isinstance(conf, (int, float)) and conf < 0.5
+        if row.get("needs_review") is True or low_conf:
             skipped += 1
             continue
 

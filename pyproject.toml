@@ -8,10 +8,20 @@ version = "0.2.0"
 description = "Извлечение данных о донатах из видеозаписей стримов (YOLO-детектор + локальный VLM)."
 readme = "README.md"
 requires-python = ">=3.10"
+# Версии закреплены по проверенным сериям:
+#  - ultralytics 8.4.x: поведение --device 'intel:*' и авто-леттербокс predict
+#    проверены именно на 8.4; минорный апгрейд ultralytics может их поменять;
+#  - openvino 2024.6.x: cpp/fast_detector собран против этих библиотек (ABI);
+#    после апгрейда openvino бинарник надо пересобрать (./cpp/build.sh).
 dependencies = [
-    "ultralytics",   # тянет cv2/numpy/torch транзитивно
-    "requests",
-    "openvino",      # C++ заголовки для cpp-движка + экспорт модели
+    "ultralytics>=8.4,<8.5",   # тянет cv2/numpy/torch транзитивно
+    "requests>=2.32,<3",
+    "openvino>=2024.6,<2025",  # C++ заголовки для cpp-движка + экспорт модели
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",  # тесты чистой логики: python -m pytest tests/
 ]
 
 # `python -m donsearcher` и команда `donsearcher` — точка входа py-движка.

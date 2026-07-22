@@ -24,6 +24,9 @@
   python3 scripts/fast_pipeline.py --video ... --sequential --overwrite
   python3 scripts/fast_pipeline.py --engine py --video ... --overwrite
   python3 scripts/fast_pipeline.py --video ... --skip-vlm   # только детекция
+  # YOLO-стадия для отдельного VLM-сервера: только кропы + метаданные событий
+  python3 scripts/fast_pipeline.py --video ... --skip-vlm --images-schema 1 \
+      --events-meta minimal --streamer Ник --platform twitch --stream-date 2026-07-06
 
 Сборка бинарника (один раз): ./cpp/build.sh
 """
@@ -153,6 +156,11 @@ def run_cpp_engine(args: argparse.Namespace) -> None:
             f"Бинарник не найден: {binary}\nСоберите его: ./cpp/build.sh (Windows: cmake, см. README)"
         )
 
+    # Промпт загружается один раз до старта VLM-воркера (fail fast при опечатке
+    # в --vlm-prompt); текст кладётся в args — его читает _process_event_vlm.
+    vlm_prompt_text, vlm_prompt_version = vp.load_prompt(args.vlm_prompt)
+    args.vlm_prompt_text = vlm_prompt_text
+
     run_name = args.run_name or f"{vp.safe_filename(video_path.stem)}_vlm_v6_run"
     output_dir = (project_dir / args.output_dir / run_name).resolve()
     events_dir = output_dir / "events"
@@ -170,11 +178,19 @@ def run_cpp_engine(args: argparse.Namespace) -> None:
                 f"Use --overwrite to replace it or --run-name to pick another name."
             )
 
+    save_crops, save_annotated, save_original = vp.unpack_images_schema(args.images_schema)
+    save_any_images = save_crops or save_annotated or save_original
+
     output_dir.mkdir(parents=True, exist_ok=True)
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    if not args.no_save_images:
-        for d in (events_dir, crops_dir, frames_dir, original_frames_dir):
-            d.mkdir(parents=True, exist_ok=True)
+    if save_any_images:
+        events_dir.mkdir(parents=True, exist_ok=True)
+        if save_crops:
+            crops_dir.mkdir(parents=True, exist_ok=True)
+        if save_annotated:
+            frames_dir.mkdir(parents=True, exist_ok=True)
+        if save_original:
+            original_frames_dir.mkdir(parents=True, exist_ok=True)
 
     mode = "sequential" if args.sequential else "parallel"
     print(f"Project:      {project_dir}")
@@ -203,7 +219,11 @@ def run_cpp_engine(args: argparse.Namespace) -> None:
         "--max-processed-frames", str(args.max_processed_frames),
         "--tmp-dir", str(tmp_dir),
     ]
-    if args.no_save_images:
+    # У cpp-бинарника гранулярности нет — только его внутренний --no-save-images
+    # (не пишет tmp ann/orig; tmp-кропы пишутся всегда, они нужны VLM). Передаём
+    # его, когда ни annotated, ни original не нужны; иначе бинарник пишет оба tmp,
+    # а Python копирует в events/ только запрошенные биты (--images-schema).
+    if not (save_annotated or save_original):
         cmd.append("--no-save-images")
 
     vlm_results: list[tuple[dict[str, Any], dict[str, Any]]] = []
@@ -241,6 +261,18 @@ def run_cpp_engine(args: argparse.Namespace) -> None:
     vp.write_csv(totals_csv, totals_rows)
     vp.write_jsonl(jsonl_path, jsonl_rows)
 
+    # Сайдкар для раздельного запуска стадий (см. пояснение в donsearcher.reports).
+    events_meta_path: Optional[Path] = None
+    if args.events_meta:
+        events_meta_path = output_dir / "events_meta.jsonl"
+        run_record = vp.build_run_record(
+            args.events_meta, video_path.name,
+            args.streamer, args.platform, args.stream_date,
+            run_name=run_name, fps=det["fps"], frame_step=args.frame_step,
+            conf=args.conf, images_schema=args.images_schema, engine="cpp",
+        )
+        vp.write_events_meta(events_meta_path, run_record, event_rows, args.events_meta)
+
     yolo_elapsed = round(det["yolo_elapsed_sec"], 2)
 
     with metadata_json.open("w", encoding="utf-8") as f:
@@ -270,15 +302,19 @@ def run_cpp_engine(args: argparse.Namespace) -> None:
                 "event_split_height_frac": args.event_split_height_frac,
                 "vlm_server_url": args.vlm_server_url,
                 "vlm_model": args.vlm_model,
-                "vlm_prompt_version": vp.VLM_PROMPT_VERSION,
-                "vlm_prompt": vp.VLM_PROMPT,
+                "vlm_prompt_version": vlm_prompt_version,
+                "vlm_prompt": vlm_prompt_text,
                 "vlm_retries": args.vlm_retries,
                 "vlm_timeout": args.vlm_timeout,
                 "vlm_max_tokens": args.vlm_max_tokens,
                 "vlm_temperature": args.vlm_temperature,
                 "skip_vlm": args.skip_vlm,
                 "sequential": args.sequential,
-                "no_save_images": args.no_save_images,
+                "images_schema": args.images_schema,
+                "events_meta": args.events_meta,
+                "streamer": args.streamer,
+                "platform": args.platform,
+                "stream_date": args.stream_date,
                 "yolo_elapsed_sec": yolo_elapsed,
                 "yolo_infer_sec": round(det["infer_sec"], 2),
                 "yolo_decode_wait_sec": round(det["decode_wait_sec"], 2),
@@ -295,7 +331,8 @@ def run_cpp_engine(args: argparse.Namespace) -> None:
                     "events_summary_csv": str(events_csv),
                     "totals_by_currency_csv": str(totals_csv),
                     "donations_jsonl": str(jsonl_path),
-                    "events_dir": "" if args.no_save_images else str(events_dir),
+                    "events_dir": str(events_dir) if save_any_images else "",
+                    "events_meta_jsonl": str(events_meta_path) if events_meta_path else "",
                 },
             },
             f,
@@ -321,8 +358,10 @@ def run_cpp_engine(args: argparse.Namespace) -> None:
     print(f"Events summary:      {events_csv}")
     print(f"Totals by currency:  {totals_csv}")
     print(f"Raw JSONL:           {jsonl_path}")
-    if not args.no_save_images:
+    if save_any_images:
         print(f"Best crops/frames:   {events_dir}")
+    if events_meta_path:
+        print(f"Events meta:         {events_meta_path}")
 
 
 def _run_sequential(

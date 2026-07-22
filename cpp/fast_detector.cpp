@@ -37,6 +37,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -658,8 +659,18 @@ int main(int argc, char** argv) {
     stbi_write_png_compression_level = 2;
 
     std::string model_xml = args.model;
-    if (model_xml.size() < 4 || model_xml.substr(model_xml.size() - 4) != ".xml")
-        model_xml += "/best.xml";
+    if (model_xml.size() < 4 || model_xml.substr(model_xml.size() - 4) != ".xml") {
+        // каталог экспорта ultralytics: имя .xml повторяет имя .pt, ищем его
+        std::string found;
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::directory_iterator(model_xml, ec)) {
+            if (entry.path().extension() == ".xml") {
+                found = entry.path().string();
+                break;
+            }
+        }
+        model_xml = found.empty() ? model_xml + "/best.xml" : found;
+    }
 
     VideoInfo vi = probe_video(args.video);
 

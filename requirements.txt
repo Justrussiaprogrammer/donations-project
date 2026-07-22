@@ -3,10 +3,11 @@
 #
 # Это ставит пакет donsearcher в editable-режиме (-e .) вместе со всеми
 # Python-зависимостями, объявленными в pyproject.toml ([project.dependencies]:
-# ultralytics, requests, openvino; cv2/numpy подтягиваются транзитивно).
+# ultralytics, requests, openvino; cv2/numpy подтягиваются транзитивно) и
+# dev-инструментами ([dev]: pytest — запуск тестов: python -m pytest tests/).
 # После этого `import donsearcher` и команда `donsearcher` работают из любого
 # каталога без правки sys.path.
 #
 # Для cpp-движка дополнительно нужны системные g++ и ffmpeg, затем сборка
 # ./cpp/build.sh (openvino выше даёт и C++ заголовки, и экспорт модели).
--e .
+-e .[dev]

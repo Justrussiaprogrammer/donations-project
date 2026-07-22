@@ -44,8 +44,8 @@ import cv2
 # Only what the orchestrator itself uses; the package's __init__ is the single
 # place that re-exports the full public surface (donsearcher.<name>).
 from .geometry import box_area, box_height, clamp, expand_box, push_recent_height
-from .textutil import safe_filename, seconds_to_timestamp
-from .vlm_client import VLM_PROMPT, VLM_PROMPT_VERSION
+from .textutil import parse_img_size, safe_filename, seconds_to_timestamp, unpack_images_schema
+from .vlm_client import DEFAULT_PROMPT_VERSION, load_prompt
 from .events import (
     CandidateCrop,
     DonationEvent,
@@ -55,7 +55,7 @@ from .events import (
 )
 from .vlm_events import _make_error_rows, _process_event_vlm, _vlm_worker
 from .dedup import GENERIC_DONORS, GENERIC_MESSAGES, build_totals_rows, dedup_events
-from .reports import write_csv, write_jsonl
+from .reports import build_run_record, write_csv, write_events_meta, write_jsonl
 from .training import TRAIN_STRATEGIES, TrainingCollector
 
 
@@ -79,11 +79,23 @@ def run_pipeline(args: argparse.Namespace) -> None:
     if not video_path.exists():
         raise FileNotFoundError(f"Video not found: {video_path}")
 
+    # Промпт загружается один раз до старта VLM-воркера (fail fast при опечатке
+    # в --vlm-prompt); текст кладётся в args — его читает _process_event_vlm.
+    vlm_prompt_text, vlm_prompt_version = load_prompt(args.vlm_prompt)
+    args.vlm_prompt_text = vlm_prompt_text
+
     # Training-data collection turns the run into a pure dataset-collection mode:
     # no VLM, no event/totals reports, no events/ crop tree — just the dataset files
     # written straight into the run dir.
     train_strategies = {s.strip() for s in args.train_select.split(",") if s.strip()}
     training_mode = bool(train_strategies)
+
+    # Битовая маска сохраняемых изображений (fail fast при значении вне 0..7).
+    save_crops, save_annotated, save_original = unpack_images_schema(args.images_schema)
+    save_any_images = save_crops or save_annotated or save_original
+    if args.events_meta and not save_crops:
+        print("ВНИМАНИЕ: --events-meta задан, но бит crops в --images-schema выключен — "
+              "поле crop в метаданных будет пустым (VLM-серверу нечего будет обрабатывать).")
 
     run_name = args.run_name or f"{safe_filename(video_path.stem)}_vlm_v6_run"
     output_dir = (project_dir / args.output_dir / run_name).resolve()
@@ -104,11 +116,14 @@ def run_pipeline(args: argparse.Namespace) -> None:
 
     output_dir.mkdir(parents=True, exist_ok=True)
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    if not args.no_save_images and not training_mode:
+    if save_any_images and not training_mode:
         events_dir.mkdir(parents=True, exist_ok=True)
-        crops_dir.mkdir(parents=True, exist_ok=True)
-        frames_dir.mkdir(parents=True, exist_ok=True)
-        original_frames_dir.mkdir(parents=True, exist_ok=True)
+        if save_crops:
+            crops_dir.mkdir(parents=True, exist_ok=True)
+        if save_annotated:
+            frames_dir.mkdir(parents=True, exist_ok=True)
+        if save_original:
+            original_frames_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Project:      {project_dir}")
     print(f"YOLO model:   {model_path}")
@@ -139,8 +154,9 @@ def run_pipeline(args: argparse.Namespace) -> None:
     if uncertain_on:
         print(f"Detection threshold lowered to {detect_conf} for 'uncertain' capture "
               f"(donations still require conf >= {args.conf}).")
-    # Annotated previews need result.plot() even when --no-save-images is set.
-    need_annotated = (not args.no_save_images) or training_mode
+    # result.plot() нужен только если сохраняются annotated-кадры или включён
+    # training-режим (превью датасета рисуются из annotated).
+    need_annotated = save_annotated or training_mode
 
     vlm_queue: queue.Queue = queue.Queue()
     vlm_results: list[tuple[dict[str, Any], dict[str, Any]]] = []
@@ -289,16 +305,18 @@ def run_pipeline(args: argparse.Namespace) -> None:
 
                 det_id = detection_counter
                 detection_counter += 1
+                # Кроп пишется всегда: он нужен VLM (даже при выключенном бите crops
+                # OCR читает его из tmp) и копируется в best_crops при закрытии события.
                 tmp_crop_path = tmp_dir / f"det{det_id:07d}_crop.png"
                 cv2.imwrite(str(tmp_crop_path), crop)
-                if not args.no_save_images:
+                tmp_ann_path = None
+                tmp_orig_path = None
+                if save_annotated and annotated is not None:
                     tmp_ann_path = tmp_dir / f"det{det_id:07d}_ann.jpg"
-                    tmp_orig_path = tmp_dir / f"det{det_id:07d}_orig.png"
                     cv2.imwrite(str(tmp_ann_path), annotated)
+                if save_original:
+                    tmp_orig_path = tmp_dir / f"det{det_id:07d}_orig.png"
                     cv2.imwrite(str(tmp_orig_path), frame)
-                else:
-                    tmp_ann_path = None
-                    tmp_orig_path = None
 
                 matched = find_matching_event(
                     events=active_events,
@@ -439,6 +457,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
     duplicate_events = 0
     totals_skipped_events = 0
 
+    events_meta_path: Optional[Path] = None
     if not training_mode:
         event_rows = [r[0] for r in vlm_results]
         jsonl_rows = [r[1] for r in vlm_results]
@@ -452,6 +471,18 @@ def run_pipeline(args: argparse.Namespace) -> None:
         write_csv(events_csv, event_rows)
         write_csv(totals_csv, totals_rows)
         write_jsonl(jsonl_path, jsonl_rows)
+
+        # Сайдкар для раздельного запуска стадий (сервер A -> сервер B):
+        # уезжает вместе с кропами, VLM-сервер по нему связывает OCR с событиями.
+        if args.events_meta:
+            events_meta_path = output_dir / "events_meta.jsonl"
+            run_record = build_run_record(
+                args.events_meta, video_path.name,
+                args.streamer, args.platform, args.stream_date,
+                run_name=run_name, fps=fps, frame_step=args.frame_step,
+                conf=args.conf, images_schema=args.images_schema,
+            )
+            write_events_meta(events_meta_path, run_record, event_rows, args.events_meta)
 
     with metadata_json.open("w", encoding="utf-8") as f:
         json.dump(
@@ -476,15 +507,19 @@ def run_pipeline(args: argparse.Namespace) -> None:
                 "event_split_height_frac": args.event_split_height_frac,
                 "vlm_server_url": args.vlm_server_url,
                 "vlm_model": args.vlm_model,
-                "vlm_prompt_version": VLM_PROMPT_VERSION,
-                "vlm_prompt": VLM_PROMPT,
+                "vlm_prompt_version": vlm_prompt_version,
+                "vlm_prompt": vlm_prompt_text,
                 "vlm_retries": args.vlm_retries,
                 "vlm_timeout": args.vlm_timeout,
                 "vlm_max_tokens": args.vlm_max_tokens,
                 "vlm_temperature": args.vlm_temperature,
                 "skip_vlm": args.skip_vlm,
                 "sequential": args.sequential,
-                "no_save_images": args.no_save_images,
+                "images_schema": args.images_schema,
+                "events_meta": args.events_meta,
+                "streamer": args.streamer,
+                "platform": args.platform,
+                "stream_date": args.stream_date,
                 "vlm_mode": mode,
                 "yolo_elapsed_sec": yolo_elapsed,
                 "vlm_elapsed_sec": vlm_elapsed,
@@ -515,7 +550,8 @@ def run_pipeline(args: argparse.Namespace) -> None:
                     "events_summary_csv": str(events_csv),
                     "totals_by_currency_csv": str(totals_csv),
                     "donations_jsonl": str(jsonl_path),
-                    "events_dir": "" if args.no_save_images else str(events_dir)
+                    "events_dir": str(events_dir) if save_any_images else "",
+                    "events_meta_jsonl": str(events_meta_path) if events_meta_path else "",
                 })
             },
             f,
@@ -550,8 +586,10 @@ def run_pipeline(args: argparse.Namespace) -> None:
     print(f"Events summary:      {events_csv}")
     print(f"Totals by currency:  {totals_csv}")
     print(f"Raw JSONL:           {jsonl_path}")
-    if not args.no_save_images:
+    if save_any_images:
         print(f"Best crops/frames:   {events_dir}")
+    if events_meta_path:
+        print(f"Events meta:         {events_meta_path}")
 
 
 # -----------------------------
@@ -574,7 +612,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Передаётся в ultralytics как есть. Для .pt: 'cpu' или CUDA-индекс "
                         "('0', 'cuda:0'). Для OpenVINO-модели: 'intel:cpu' / 'intel:gpu' / "
                         "'intel:npu'. Значение по умолчанию 'cpu'")
-    p.add_argument("--img-size", type=int, default=640)
+    p.add_argument("--img-size", type=parse_img_size, default=640,
+                   help="imgsz ultralytics: '640' (квадратный леттербокс) или "
+                        "'576,1024' (высота,ширина — для прямоугольной статичной "
+                        "OpenVINO-модели)")
     p.add_argument("--conf", type=float, default=0.5)
     p.add_argument("--frame-step", type=int, default=10)
     p.add_argument("--padding-x", type=int, default=20)
@@ -593,6 +634,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--vlm-server-url", default="http://127.0.0.1:8081/v1/chat/completions")
     p.add_argument("--vlm-model", default="Qwen3-VL")
+    p.add_argument("--vlm-prompt", default=DEFAULT_PROMPT_VERSION,
+                   help="Версия промпта из prompts/ (например 'v7') или путь к "
+                        f".txt-файлу с промптом. По умолчанию {DEFAULT_PROMPT_VERSION} "
+                        "(лучший по бенчмарку на test/gt)")
     p.add_argument("--vlm-timeout", type=int, default=300)
     p.add_argument("--vlm-retries", type=int, default=2,
                    help="Retries for failed VLM requests (network/server errors only)")
@@ -603,9 +648,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sequential", action="store_true",
                    help="Run YOLO fully, then VLM fully (no overlap). "
                         "Gives clean per-stage timing for benchmarking")
-    p.add_argument("--no-save-images", action="store_true",
-                   help="Do not save any image files (crops, frames). "
-                        "Output is CSV/JSONL only")
+    p.add_argument("--images-schema", type=int, default=7,
+                   help="Битовая маска сохраняемых изображений: 1=best_crops, "
+                        "2=annotated_frames, 4=original_frames (сумма степеней двойки). "
+                        "7 — всё (по умолчанию), 0 — ничего (только CSV/JSONL, бывший "
+                        "--no-save-images), 1 — только кропы (YOLO-стадия для "
+                        "отдельного VLM-сервера), 5 — кропы + оригинальные кадры")
+
+    # Раздельный запуск стадий: сервер A (YOLO) пишет кропы + events_meta.jsonl,
+    # сервер B (VLM) обрабатывает их отдельно. Провенанс стрима (дата/платформа/
+    # стример) в видео отсутствует — передаётся флагами и попадает в метаданные.
+    p.add_argument("--events-meta", choices=["minimal", "full"], default="",
+                   help="Писать events_meta.jsonl рядом с отчётами: minimal — "
+                        "id/crop/время доната + дата/платформа/стример прогона "
+                        "(экономный рабочий вариант для передачи на VLM-сервер); "
+                        "full — все детекторные поля событий (полный отчёт для "
+                        "проверки/заказчика). По умолчанию выключено")
+    p.add_argument("--streamer", default="", help="Имя стримера (в events_meta.jsonl)")
+    p.add_argument("--platform", default="", help="Платформа стрима (в events_meta.jsonl)")
+    p.add_argument("--stream-date", default="", help="Дата стрима (в events_meta.jsonl)")
 
     # Training-data collection (for improving the YOLO detector). Independent of
     # the event-crop saving above; pairs naturally with --skip-vlm.

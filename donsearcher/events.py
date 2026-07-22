@@ -28,8 +28,8 @@ class CandidateCrop:
     base_box: tuple[int, int, int, int]
     padded_box: tuple[int, int, int, int]
     crop_path: Path
-    annotated_frame_path: Optional[Path]  # None when --no-save-images
-    original_frame_path: Optional[Path]   # None when --no-save-images
+    annotated_frame_path: Optional[Path]  # None когда бит annotated выключен в --images-schema
+    original_frame_path: Optional[Path]   # None когда бит original выключен в --images-schema
     score: float
 
 
