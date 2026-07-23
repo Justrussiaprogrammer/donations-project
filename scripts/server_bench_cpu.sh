@@ -193,6 +193,21 @@ OUT="benchmarks/server_cpu_$(hostname)_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$OUT"
 DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$VIDEO")
 
+# End-to-end уровня 3 для одной модели; пропуск, если её OpenVINO-каталога нет
+# (на сервере может быть экспортирована только часть моделей — не валим прогон).
+# py-openvino/cpp-cpu берут OpenVINO-каталог; --model-pt этим движкам не нужен.
+run_e2e() {   # $1=openvino-dir  $2=imgsz  $3=подпись  [$4=pt для справки]
+    if [[ ! -d "$1" ]]; then
+        echo "--- $3: пропуск (нет каталога $1) ---"
+        return 0
+    fi
+    echo "--- $3 (ov=$1, imgsz=$2) ---"
+    python3 scripts/benchmark_detector.py --video "$VIDEO" --conf "$CONF" \
+        --engines py-openvino,cpp-cpu --no-save-images --repeats 2 \
+        --img-size "$2" --model-openvino "$1" --model-pt "${4:-models/best.pt}" \
+        || echo "  (ур.3 $3 упал — см. трейс выше, продолжаю)"
+}
+
 {
 hwinfo
 echo "Видео: $VIDEO (${DUR}s)   step: $FRAME_STEP   conf: $CONF"
@@ -209,19 +224,18 @@ done
 
 echo
 echo "=== 2. Потолок через ultralytics (bench_infer.py) ==="
-python3 scripts/bench_infer.py --model models/best_1024x1024_openvino_model \
-    --device intel:cpu --img-size 576,1024 --n 50
+if [[ -d models/best_1024x1024_openvino_model ]]; then
+    python3 scripts/bench_infer.py --model models/best_1024x1024_openvino_model \
+        --device intel:cpu --img-size 576,1024 --n 50 \
+        || echo "  (ур.2 упал — продолжаю)"
+else
+    echo "  пропуск: нет models/best_1024x1024_openvino_model"
+fi
 
 echo
 echo "=== 3. End-to-end: детекция видео (py-openvino + cpp-cpu, 2 повтора) ==="
-python3 scripts/benchmark_detector.py --video "$VIDEO" --conf "$CONF" \
-    --engines py-openvino,cpp-cpu --no-save-images --repeats 2 \
-    --img-size 384,640 \
-    --model-pt models/best.pt --model-openvino models/best_openvino_model
-python3 scripts/benchmark_detector.py --video "$VIDEO" --conf "$CONF" \
-    --engines py-openvino,cpp-cpu --no-save-images --repeats 2 \
-    --img-size 576,1024 \
-    --model-pt models/best_1024x1024.pt --model-openvino models/best_1024x1024_openvino_model
+run_e2e models/best_openvino_model            384,640  "best 384x640"      models/best.pt
+run_e2e models/best_1024x1024_openvino_model  576,1024 "yolo26s 576x1024"  models/best_1024x1024.pt
 
 echo
 echo "=== 4. Изолированный sw-декод всего видео (аналог NVDEC ур.4 на GPU) ==="
