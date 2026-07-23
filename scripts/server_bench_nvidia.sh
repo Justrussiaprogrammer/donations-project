@@ -24,6 +24,8 @@
 # уникальны ($$), несколько копий на одной карте не мешают друг другу.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# shellcheck disable=SC1091
+source scripts/bench_hwinfo.sh   # hwinfo: CPU-модель/RAM/VRAM в каждый отчёт
 
 MODEL_PT="${MODEL_PT:-models/best_1024x1024.pt}"
 IMGSZ="${IMGSZ:-576,1024}"
@@ -84,15 +86,17 @@ if [[ "${1:-}" == "--parallel" ]]; then
     OUT="benchmarks/server_gpu_$(hostname)_par${N}_$(date +%Y%m%d_%H%M%S)_$$"
     mkdir -p "$OUT"
     DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$VIDEO")
-    echo "=== $N параллельных видео: $ENGINE_B (batch=$BATCH), $VIDEO (${DUR}s) ==="
-    nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+    { hwinfo
+      echo
+      echo "=== $N параллельных видео: $ENGINE_B (batch=$BATCH), $VIDEO (${DUR}s) ==="
+    } | tee "$OUT/report.txt"
     for i in $(seq 1 "$N"); do
         python3 scripts/bench_pipe.py --model "$ENGINE_B" --video "$VIDEO" \
             --img-size "$IMGSZ" --frame-step "$FRAME_STEP" --batch "$BATCH" \
             --json "$OUT/pipe_$i.json" >"$OUT/pipe_$i.log" 2>&1 &
     done
     wait
-    python3 - "$OUT" "$N" "$DUR" <<'PY' | tee "$OUT/report.txt"
+    python3 - "$OUT" "$N" "$DUR" <<'PY' | tee -a "$OUT/report.txt"
 import json, sys
 from pathlib import Path
 out, n, dur = Path(sys.argv[1]), int(sys.argv[2]), float(sys.argv[3])
@@ -127,8 +131,7 @@ DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$VIDEO")
 RUN="_bench_trt_$$"
 
 {
-echo "=== Железо ==="
-nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
+hwinfo
 echo "Видео: $VIDEO (${DUR}s)  модель: $MODEL_PT  imgsz: $IMGSZ  step: $FRAME_STEP"
 
 echo

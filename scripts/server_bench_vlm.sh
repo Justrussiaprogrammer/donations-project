@@ -33,6 +33,8 @@
 #   GPU_LAYERS (999 — все слои на GPU; 0 — целиком CPU)  LLAMA_DIR (~/llama.cpp)
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# shellcheck disable=SC1091
+source scripts/bench_hwinfo.sh   # hwinfo: CPU-модель/RAM/VRAM в отчёт
 
 MODEL_HF="${MODEL_HF:-Qwen/Qwen3-VL-8B-Instruct-GGUF:Q4_K_M}"
 CROPS="${CROPS:-test/gt/donations}"
@@ -118,12 +120,7 @@ OUT="benchmarks/server_vlm_$(hostname)_$(date +%Y%m%d_%H%M%S)_$$"
 mkdir -p "$OUT"
 SERVER_URL="http://127.0.0.1:$PORT/v1/chat/completions"
 
-echo "=== Железо ===" | tee "$OUT/report.txt"
-if command -v nvidia-smi >/dev/null; then
-    nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader | tee -a "$OUT/report.txt"
-else
-    echo "CPU-режим (нет nvidia-smi)" | tee -a "$OUT/report.txt"
-fi
+hwinfo | tee "$OUT/report.txt"
 echo "Модель: $MODEL_HF  кропов: $N_CROPS ($CROPS)  ngl $GPU_LAYERS" \
     | tee -a "$OUT/report.txt"
 echo "image-min-tokens: $IMAGE_MIN_TOKENS  KV: $KV_TYPE  ctx: $CTX ($CTX_PER_SLOT/слот × np$NP)  конкурентности: [$CONCURRENCY]" \
