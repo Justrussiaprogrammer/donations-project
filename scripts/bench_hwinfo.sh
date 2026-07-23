@@ -20,12 +20,21 @@ hwinfo() {
     echo "host: $(hostname)   дата: $(date -Is)"
 
     # --- GPU ---
+    # Важно: на CPU-серверах бинарник nvidia-smi может быть УСТАНОВЛЕН (nvidia-utils
+    # в образе), но без драйвера/карты запрос падает и печатает текст ошибки. Поэтому
+    # проверяем не наличие бинарника, а УСПЕШНЫЙ запрос с валидным CSV (есть запятые).
+    # Захват в переменную с `|| true` — иначе ненулевой код под set -e/pipefail у
+    # вызывающего скрипта оборвал бы прогон прямо здесь.
+    local gpu_csv=""
     if command -v nvidia-smi >/dev/null 2>&1; then
-        nvidia-smi --query-gpu=name,driver_version,memory.total,memory.used \
-            --format=csv,noheader 2>/dev/null \
+        gpu_csv=$(nvidia-smi --query-gpu=name,driver_version,memory.total,memory.used \
+            --format=csv,noheader 2>/dev/null) || gpu_csv=""
+    fi
+    if [[ -n "$gpu_csv" && "$gpu_csv" == *,* ]]; then
+        printf '%s\n' "$gpu_csv" \
             | awk -F', *' '{printf "GPU: %s | драйвер %s | VRAM %s (занято %s)\n",$1,$2,$3,$4}'
     else
-        echo "GPU: нет (nvidia-smi отсутствует) — CPU-режим"
+        echo "GPU: нет/недоступна (нет карты или драйвера) — CPU-режим"
     fi
 
     # --- CPU (из /proc/cpuinfo — не зависит от локали lscpu) ---
@@ -51,7 +60,9 @@ hwinfo() {
 
 gpu_vram_total() {
     command -v nvidia-smi >/dev/null 2>&1 || return 0
-    nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1
+    local v
+    v=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1) || v=""
+    [[ "$v" =~ ^[0-9]+$ ]] && printf '%s' "$v"  # пусто, если карта/драйвер недоступны
 }
 
 ram_used_mb() {
